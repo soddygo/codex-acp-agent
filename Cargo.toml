@@ -1,0 +1,32 @@
+[package]
+name = "codex-acp"
+authors = ["<gawaine2111@gmail.com>"]
+version = "0.1.0"
+edition = "2024"
+description = "ACP-compatible agent that bridges the OpenAI Codex runtime with ACP clients over stdio."
+readme = "README.md"
+# Match the pinned toolchain in rust-toolchain.toml
+rust-version = "1.89"
+
+[dependencies]
+agent-client-protocol = { version = "0.4.0" }
+anyhow = { version = "1" }
+async-trait = { version = "0.1" }
+codex-cli = { git = "https://github.com/openai/codex" }
+codex-core = { git = "https://github.com/openai/codex" }
+tokio = { version = "1.47.1", features = [
+  "macros",
+  "rt",
+  "time",
+  "io-std",
+  "io-util",
+  "net",
+  "process",
+  "sync",
+] }
+tokio-util = { version = "0.7.16", features = ["compat"] }
+serde = { version = "1.0.225", features = ["derive"] }
+serde_json = { version = "1.0.145", features = ["raw_value"] }
+tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1" }
