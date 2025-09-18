@@ -26,15 +26,14 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 mod commands;
-// Placeholder for per-session state. This will later hold the Codex
-// conversation handle and any bookkeeping needed for streaming events.
+// Placeholder for per-session state. Holds the Codex conversation
+// handle, its id (for status/reporting), and bookkeeping for streaming.
 #[derive(Clone)]
 struct SessionState {
     #[allow(dead_code)]
     created: SystemTime,
-    // TODO: replace with actual Codex conversation handle
-    #[allow(dead_code)]
-    conversation_id: Option<String>,
+    // Conversation id string for display/logging purposes.
+    conversation_id: String,
     conversation: Option<Arc<CodexConversation>>,
     current_approval: AskForApproval,
     current_sandbox: SandboxPolicy,
@@ -223,7 +222,7 @@ impl Agent for CodexAgent {
             session_id.to_string(),
             SessionState {
                 created: SystemTime::now(),
-                conversation_id: Some(conversation_id.to_string()),
+                conversation_id: conversation_id.to_string(),
                 conversation: conversation_opt,
                 current_approval: AskForApproval::OnRequest,
                 current_sandbox: SandboxPolicy::new_workspace_write_policy(),

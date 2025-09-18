@@ -473,7 +473,7 @@ Notes for Agents
                     state.current_approval,
                     state.current_sandbox.clone(),
                     state.token_usage.clone(),
-                    state.conversation_id.clone().unwrap_or_default(),
+                    state.conversation_id.clone(),
                 )
             } else {
                 (
