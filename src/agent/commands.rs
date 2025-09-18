@@ -1,6 +1,7 @@
 use super::*;
 use agent_client_protocol::{AvailableCommand, AvailableCommandInput};
 use codex_core::protocol::{AskForApproval, EventMsg, Op, SandboxPolicy, Submission};
+use std::{fs, io};
 use tokio::sync::oneshot;
 
 impl CodexAgent {
@@ -70,19 +71,9 @@ impl CodexAgent {
                         "AGENTS file already exists: {}\nUse /init --force to overwrite.",
                         existing.join(", ")
                     );
+
                     let (tx, rx) = oneshot::channel();
-                    self.session_update_tx
-                        .send((
-                            SessionNotification {
-                                session_id: session_id.clone(),
-                                update: SessionUpdate::AgentMessageChunk {
-                                    content: msg.into(),
-                                },
-                                meta: None,
-                            },
-                            tx,
-                        ))
-                        .map_err(|_| Error::internal_error())?;
+                    self.send_message_chunk(session_id, msg.into(), tx)?;
                     let _ = rx.await;
                     return Ok(true);
                 }
@@ -117,12 +108,12 @@ Notes for Agents
 "#;
 
                 // Try to write the file; on errors, surface a message.
-                let result = (|| -> std::io::Result<()> {
+                let result = (|| -> io::Result<()> {
                     // Ensure parent exists (workspace root should exist already).
                     if let Some(parent) = target.parent() {
-                        std::fs::create_dir_all(parent)?;
+                        fs::create_dir_all(parent)?;
                     }
-                    std::fs::write(&target, template)
+                    fs::write(&target, template)
                 })();
 
                 let msg = match result {
@@ -138,36 +129,14 @@ Notes for Agents
                 };
 
                 let (tx, rx) = oneshot::channel();
-                self.session_update_tx
-                    .send((
-                        SessionNotification {
-                            session_id: session_id.clone(),
-                            update: SessionUpdate::AgentMessageChunk {
-                                content: msg.into(),
-                            },
-                            meta: None,
-                        },
-                        tx,
-                    ))
-                    .map_err(|_| Error::internal_error())?;
+                self.send_message_chunk(session_id, msg.into(), tx)?;
                 let _ = rx.await;
                 return Ok(true);
             }
             "status" => {
                 let status_text = self.render_status(&sid_str).await;
                 let (tx, rx) = oneshot::channel();
-                self.session_update_tx
-                    .send((
-                        SessionNotification {
-                            session_id: session_id.clone(),
-                            update: SessionUpdate::AgentMessageChunk {
-                                content: status_text.into(),
-                            },
-                            meta: None,
-                        },
-                        tx,
-                    ))
-                    .map_err(|_| Error::internal_error())?;
+                self.send_message_chunk(session_id, status_text.into(), tx)?;
                 let _ = rx.await;
                 return Ok(true);
             }
@@ -179,18 +148,7 @@ Notes for Agents
                         self.config.model,
                     );
                     let (tx, rx) = oneshot::channel();
-                    self.session_update_tx
-                        .send((
-                            SessionNotification {
-                                session_id: session_id.clone(),
-                                update: SessionUpdate::AgentMessageChunk {
-                                    content: msg.into(),
-                                },
-                                meta: None,
-                            },
-                            tx,
-                        ))
-                        .map_err(|_| Error::internal_error())?;
+                    self.send_message_chunk(session_id, msg.into(), tx)?;
                     let _ = rx.await;
                     return Ok(true);
                 }
@@ -213,18 +171,7 @@ Notes for Agents
                 } else {
                     let msg = "Dev mock mode: /model not available without Codex backend";
                     let (tx, rx) = oneshot::channel();
-                    self.session_update_tx
-                        .send((
-                            SessionNotification {
-                                session_id: session_id.clone(),
-                                update: SessionUpdate::AgentMessageChunk {
-                                    content: msg.into(),
-                                },
-                                meta: None,
-                            },
-                            tx,
-                        ))
-                        .map_err(|_| Error::internal_error())?;
+                    self.send_message_chunk(session_id, msg.into(), tx)?;
                     let _ = rx.await;
                     return Ok(true);
                 }
@@ -232,18 +179,7 @@ Notes for Agents
                 // Provide immediate feedback to the user.
                 let ack = format!("Requested model change to: {}", rest);
                 let (tx, rx) = oneshot::channel();
-                self.session_update_tx
-                    .send((
-                        SessionNotification {
-                            session_id: session_id.clone(),
-                            update: SessionUpdate::AgentMessageChunk {
-                                content: ack.into(),
-                            },
-                            meta: None,
-                        },
-                        tx,
-                    ))
-                    .map_err(|_| Error::internal_error())?;
+                self.send_message_chunk(session_id, ack.into(), tx)?;
                 let _ = rx.await;
                 return Ok(true);
             }
@@ -258,18 +194,7 @@ Notes for Agents
                     _ => {
                         let msg = "Usage: /approvals untrusted|on-request|on-failure|never";
                         let (tx, rx) = oneshot::channel();
-                        self.session_update_tx
-                            .send((
-                                SessionNotification {
-                                    session_id: session_id.clone(),
-                                    update: SessionUpdate::AgentMessageChunk {
-                                        content: msg.into(),
-                                    },
-                                    meta: None,
-                                },
-                                tx,
-                            ))
-                            .map_err(|_| Error::internal_error())?;
+                        self.send_message_chunk(session_id, msg.into(), tx)?;
                         let _ = rx.await;
                         return Ok(true);
                     }
@@ -293,18 +218,7 @@ Notes for Agents
                     } else {
                         let msg = "Dev mock mode: /approvals requires Codex backend";
                         let (tx, rx) = oneshot::channel();
-                        self.session_update_tx
-                            .send((
-                                SessionNotification {
-                                    session_id: session_id.clone(),
-                                    update: SessionUpdate::AgentMessageChunk {
-                                        content: msg.into(),
-                                    },
-                                    meta: None,
-                                },
-                                tx,
-                            ))
-                            .map_err(|_| Error::internal_error())?;
+                        self.send_message_chunk(session_id, msg.into(), tx)?;
                         let _ = rx.await;
                         return Ok(true);
                     }
@@ -316,35 +230,13 @@ Notes for Agents
                     }
                     let msg = format!("Approval policy set to: {}", value);
                     let (tx, rx) = oneshot::channel();
-                    self.session_update_tx
-                        .send((
-                            SessionNotification {
-                                session_id: session_id.clone(),
-                                update: SessionUpdate::AgentMessageChunk {
-                                    content: msg.into(),
-                                },
-                                meta: None,
-                            },
-                            tx,
-                        ))
-                        .map_err(|_| Error::internal_error())?;
+                    self.send_message_chunk(session_id, msg.into(), tx)?;
                     let _ = rx.await;
                 } else {
                     // show current (best-effort from config)
                     let msg = "Current approval policy: configured per session. Use /approvals <policy> to set.";
                     let (tx, rx) = oneshot::channel();
-                    self.session_update_tx
-                        .send((
-                            SessionNotification {
-                                session_id: session_id.clone(),
-                                update: SessionUpdate::AgentMessageChunk {
-                                    content: msg.into(),
-                                },
-                                meta: None,
-                            },
-                            tx,
-                        ))
-                        .map_err(|_| Error::internal_error())?;
+                    self.send_message_chunk(session_id, msg.into(), tx)?;
                     let _ = rx.await;
                 }
                 return Ok(true);
@@ -375,18 +267,7 @@ Notes for Agents
             } else {
                 let msg = "Dev mock mode: command requires Codex backend";
                 let (tx, rx) = oneshot::channel();
-                self.session_update_tx
-                    .send((
-                        SessionNotification {
-                            session_id: session_id.clone(),
-                            update: SessionUpdate::AgentMessageChunk {
-                                content: msg.into(),
-                            },
-                            meta: None,
-                        },
-                        tx,
-                    ))
-                    .map_err(|_| Error::internal_error())?;
+                self.send_message_chunk(session_id, msg.into(), tx)?;
                 let _ = rx.await;
                 return Ok(true);
             }
@@ -417,23 +298,12 @@ Notes for Agents
                                 },
                                 tx,
                             ))
-                            .map_err(|_| Error::internal_error())?;
+                            .map_err(Error::into_internal_error)?;
                         let _ = rx.await;
                     }
                     EventMsg::AgentMessage(msg) => {
                         let (tx, rx) = oneshot::channel();
-                        self.session_update_tx
-                            .send((
-                                SessionNotification {
-                                    session_id: session_id.clone(),
-                                    update: SessionUpdate::AgentMessageChunk {
-                                        content: msg.message.into(),
-                                    },
-                                    meta: None,
-                                },
-                                tx,
-                            ))
-                            .map_err(|_| Error::internal_error())?;
+                        self.send_message_chunk(session_id, msg.message.into(), tx)?;
                         let _ = rx.await;
                     }
                     EventMsg::TaskComplete(_) | EventMsg::ShutdownComplete => {
@@ -441,18 +311,7 @@ Notes for Agents
                     }
                     EventMsg::Error(err) => {
                         let (tx, rx) = oneshot::channel();
-                        self.session_update_tx
-                            .send((
-                                SessionNotification {
-                                    session_id: session_id.clone(),
-                                    update: SessionUpdate::AgentMessageChunk {
-                                        content: format!("Error: {}", err.message).into(),
-                                    },
-                                    meta: None,
-                                },
-                                tx,
-                            ))
-                            .map_err(|_| Error::internal_error())?;
+                        self.send_message_chunk(session_id, err.message.into(), tx)?;
                         let _ = rx.await;
                         break;
                     }

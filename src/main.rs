@@ -1,7 +1,7 @@
 mod agent;
 use agent_client_protocol::{AgentSideConnection, Client};
 use anyhow::Result;
-use tokio::sync::mpsc;
+use tokio::{io, sync::mpsc, task};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 use tracing::error;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -12,18 +12,16 @@ use codex_core::config::{Config, ConfigOverrides};
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     // Initialize tracing with env filter (RUST_LOG compatible).
-    let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("info"))
-        .unwrap();
+    let filter = EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("info"))?;
     tracing_subscriber::registry()
         .with(fmt::layer())
         .with(filter)
         .init();
 
-    let outgoing = tokio::io::stdout().compat_write();
-    let incoming = tokio::io::stdin().compat();
+    let outgoing = io::stdout().compat_write();
+    let incoming = io::stdin().compat();
 
-    let local_set = tokio::task::LocalSet::new();
+    let local_set = task::LocalSet::new();
     local_set.run_until(async move {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (client_tx, mut client_rx) = mpsc::unbounded_channel();
@@ -31,10 +29,10 @@ async fn main() -> Result<()> {
         let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default())?;
         let agent = CodexAgent::with_config(tx, client_tx.clone(), config);
         let (conn, handle_io) = AgentSideConnection::new(agent, outgoing, incoming, |fut| {
-                tokio::task::spawn_local(fut);
-            });
+            task::spawn_local(fut);
+        });
 
-        tokio::task::spawn_local(async move {
+        task::spawn_local(async move {
             loop {
                 tokio::select! {
                     msg = rx.recv() => {
