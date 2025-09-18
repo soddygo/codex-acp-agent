@@ -3,6 +3,8 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.89%2B-blue.svg)](rust-toolchain.toml)
 [![Edition](https://img.shields.io/badge/Edition-2024-blueviolet.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
 
+> This repository is implemented by the `codex` agent.
+
 An Agent Client Protocol (ACP)–compatible agent that bridges the OpenAI Codex runtime with ACP clients over stdio. This project is under active development — features are evolving and breaking changes are likely.
 
 ## Highlights
@@ -12,10 +14,6 @@ An Agent Client Protocol (ACP)–compatible agent that bridges the OpenAI Codex 
 - Slash commands with ACP AvailableCommands updates (advertised to clients on session start).
 - Status output tailored for IDEs (workspace, account, model, token usage).
 - Discovers custom prompts via `Op::ListCustomPrompts` and advertises them as commands.
-
-## Status: Work in Progress
-
-This repository is a work-in-progress implementation. Some commands are stubs, some behaviors will change, and additional capabilities are planned. Use at your own risk and expect rough edges.
 
 ## Requirements
 
@@ -28,7 +26,7 @@ Optional for development:
 ## Build
 
 ```bash
-cargo build
+make build
 ```
 
 ## Run
@@ -96,10 +94,6 @@ make smoke
     - `/model` — Show or set the current model (uses `Op::OverrideTurnContext`).
     - `/approvals` — Set approval mode (`untrusted | on-request | on-failure | never`).
     - `/status` — Rich status (workspace, account, model, token usage).
-  - Stubs or client-driven features (not fully implemented in the agent):
-    - `/init` — Creating AGENTS.md is a client/UX flow; we just inform the user.
-    - `/diff` — Git diff visualization is a TUI/client concern.
-    - `/mention` — Mentions are a client UX feature.
 
 - Available commands with custom prompts
   - On new session the agent first advertises built-in commands.
