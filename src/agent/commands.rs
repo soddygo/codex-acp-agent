@@ -1,4 +1,5 @@
 use super::*;
+use codex_core::NewConversation;
 use agent_client_protocol::{AvailableCommand, AvailableCommandInput};
 use codex_core::protocol::{AskForApproval, Op, ReviewRequest, SandboxPolicy};
 use std::{fs, io};
@@ -19,7 +20,37 @@ impl CodexAgent {
 
         // Commands implemented inline (no Codex submission needed)
         match name {
-            "new" => {}
+            "new" => {
+                // Start a new conversation within the current session
+                let (conversation_id, conversation_opt, _session_configured) = match self
+                    .conversation_manager
+                    .new_conversation(self.config.clone())
+                    .await
+                {
+                    Ok(NewConversation {
+                        conversation_id,
+                        conversation,
+                        session_configured,
+                    }) => (conversation_id, Some(conversation), session_configured),
+                    Err(e) => {
+                        let msg = format!("Failed to start new conversation: {}", e);
+                        let (tx, rx) = oneshot::channel();
+                        self.send_message_chunk(session_id, msg.into(), tx)?;
+                        let _ = rx.await;
+                        return Ok(true);
+                    }
+                };
+
+                // Update the session with the new conversation
+                session.conversation_id = conversation_id.to_string();
+                session.conversation = conversation_opt;
+                self.sessions.borrow_mut().insert(sid_str, session);
+
+                let (tx, rx) = oneshot::channel();
+                self.send_message_chunk(session_id, "✨ Started a new conversation".into(), tx)?;
+                let _ = rx.await;
+                return Ok(true);
+            }
             "init" => {
                 // Create AGENTS.md in the current workspace if it doesn't already exist.
                 let rest = _rest.trim();
@@ -232,7 +263,7 @@ Notes for Agents
                     state.current_approval,
                     state.current_sandbox.clone(),
                     state.token_usage.clone(),
-                    state.conversation_id.clone(),
+                    state.conversation_id.to_string(),
                 )
             } else {
                 (
