@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
@@ -6,27 +6,26 @@ use std::time::SystemTime;
 
 use agent_client_protocol::{
     Agent, AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
-    AvailableCommand, AvailableCommandInput, CancelNotification, ContentBlock,
+    AvailableCommand, CancelNotification, ClientCapabilities, ContentBlock,
     EmbeddedResourceResource, Error, ExtNotification, ExtRequest, ExtResponse, InitializeRequest,
     InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities,
     NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionId,
     PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionId,
-    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, V1,
+    SessionMode, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionModeRequest, SetSessionModeResponse, StopReason, ToolCall, ToolCallContent,
+    ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    V1,
 };
 use codex_core::{
-    AuthManager, CodexConversation, ConversationManager, NewConversation,
-    config::Config as CodexConfig,
-    protocol::{
-        AskForApproval, EventMsg, InputItem, Op, ReviewDecision, SandboxPolicy, Submission,
-        TokenUsage,
-    },
+    config::Config as CodexConfig, protocol::{
+        AskForApproval, EventMsg, InputItem, Op, ReviewDecision, SandboxPolicy, TokenUsage,
+    }, AuthManager, CodexConversation,
+    ConversationManager,
+    NewConversation,
 };
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot, oneshot::Sender};
-use tokio::task;
 use tracing::{info, warn};
 
 mod commands;
@@ -46,14 +45,13 @@ struct SessionState {
 
 pub struct CodexAgent {
     session_update_tx: mpsc::UnboundedSender<(SessionNotification, Sender<()>)>,
-    next_session_id: Cell<u64>,
     sessions: Rc<RefCell<HashMap<String, SessionState>>>,
     config: CodexConfig,
     conversation_manager: ConversationManager,
-    next_submit_seq: Cell<u64>,
     auth_manager: Arc<RwLock<Arc<AuthManager>>>,
-    extra_available_commands: Rc<RefCell<Vec<AvailableCommand>>>,
+    available_commands: Vec<AvailableCommand>,
     client_tx: mpsc::UnboundedSender<ClientOp>,
+    client_capabilities: RefCell<ClientCapabilities>,
 }
 
 impl CodexAgent {
@@ -62,23 +60,18 @@ impl CodexAgent {
         client_tx: mpsc::UnboundedSender<ClientOp>,
         config: CodexConfig,
     ) -> Self {
-        let auth = AuthManager::shared(
-            config.codex_home.clone(),
-            config.preferred_auth_method,
-            config.responses_originator_header.clone(),
-        );
+        let auth = AuthManager::shared(config.codex_home.clone());
         let conversation_manager = ConversationManager::new(auth.clone());
 
         Self {
             session_update_tx,
-            next_session_id: Cell::new(1),
             sessions: Rc::new(RefCell::new(HashMap::new())),
             config,
             conversation_manager,
-            next_submit_seq: Cell::new(1),
             auth_manager: Arc::new(RwLock::new(auth)),
-            extra_available_commands: Rc::new(RefCell::new(Vec::new())),
+            available_commands: commands::built_in_commands(),
             client_tx,
+            client_capabilities: RefCell::new(Default::default()),
         }
     }
 
@@ -102,7 +95,7 @@ impl CodexAgent {
     }
 
     fn handle_response_outcome(&self, resp: RequestPermissionResponse) -> ReviewDecision {
-        let decision = match resp.outcome {
+        match resp.outcome {
             RequestPermissionOutcome::Selected { option_id } => {
                 if option_id.0.as_ref() == "approve" {
                     ReviewDecision::Approved
@@ -113,8 +106,7 @@ impl CodexAgent {
                 }
             }
             RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
-        };
-        decision
+        }
     }
 
     fn normalize_stream_chunk(chunk: String) -> String {
@@ -155,6 +147,7 @@ impl Agent for CodexAgent {
                 meta: None,
             },
         ];
+        self.client_capabilities.replace(args.client_capabilities);
         let capacities = AgentCapabilities {
             load_session: true,
             prompt_capabilities: PromptCapabilities {
@@ -218,11 +211,8 @@ impl Agent for CodexAgent {
 
     async fn new_session(&self, args: NewSessionRequest) -> Result<NewSessionResponse, Error> {
         info!(?args, "Received new session request");
-        let session_id = self.next_session_id.get();
-        self.next_session_id.set(session_id + 1);
-
         // Start a new Codex conversation for this session
-        let (conversation_id, conversation_opt) = match self
+        let (conversation_id, conversation_opt, session_configured) = match self
             .conversation_manager
             .new_conversation(self.config.clone())
             .await
@@ -230,22 +220,15 @@ impl Agent for CodexAgent {
             Ok(NewConversation {
                 conversation_id,
                 conversation,
-                session_configured: _,
-            }) => (conversation_id, Some(conversation)),
+                session_configured,
+            }) => (conversation_id, Some(conversation), session_configured),
             Err(e) => {
-                let allow_mock = std::env::var("ACP_DEV_ALLOW_MOCK")
-                    .ok()
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false);
-                if allow_mock {
-                    warn!(error = %e, "Failed to create Codex conversation; starting mock session (slash-commands only)");
-                    (uuid::Uuid::new_v4(), None)
-                } else {
-                    return Err(Error::into_internal_error(e));
-                }
+                warn!(error = %e, "Failed to create Codex conversation");
+                return Err(Error::into_internal_error(e));
             }
         };
 
+        let session_id = session_configured.session_id;
         // Track the session
         self.sessions.borrow_mut().insert(
             session_id.to_string(),
@@ -259,252 +242,51 @@ impl Agent for CodexAgent {
             },
         );
 
-        // Advertise available slash commands to the client right after
-        // the session is created. Send it asynchronously to avoid racing
-        // with the NewSessionResponse delivery.
-        {
-            let available_commands = self.available_commands();
-            let session_id_for_update = SessionId(session_id.to_string().into());
-            let tx_updates = self.session_update_tx.clone();
-            task::spawn_local(async move {
-                let (tx, rx) = oneshot::channel();
-                let _ = tx_updates.send((
-                    SessionNotification {
-                        session_id: session_id_for_update,
-                        update: SessionUpdate::AvailableCommandsUpdate { available_commands },
+        let (tx, rx) = oneshot::channel();
+        let _ = self.session_update_tx.send((
+            SessionNotification {
+                session_id: SessionId(session_id.clone().to_string().into()),
+                update: SessionUpdate::AvailableCommandsUpdate {
+                    available_commands: self.available_commands.clone(),
+                },
+                meta: None,
+            },
+            tx,
+        ));
+        let _ = rx.await;
+
+        Ok(NewSessionResponse {
+            session_id: SessionId(session_configured.session_id.to_string().into()),
+            modes: Some(SessionModeState {
+                current_mode_id: SessionModeId("auto".into()),
+                available_modes: vec![
+                    SessionMode {
+                        id: SessionModeId("read-only".into()),
+                        name: "Read Only".to_string(),
+                        description: Some("Codex can read files and answer questions. Codex requires approval to make edits, run commands, or access network".to_string()),
                         meta: None,
                     },
-                    tx,
-                ));
-                let _ = rx.await;
-            });
-        }
-
-        // Discover custom prompts and cache as available commands.
-        {
-            let sid_str = session_id.to_string();
-            let tx_updates = self.session_update_tx.clone();
-            let submit_seq = self.next_submit_seq.get();
-            self.next_submit_seq.set(submit_seq + 1);
-            let submit_id = format!("s{}-{}", sid_str, submit_seq);
-            let session_map = self.sessions.borrow();
-            let extra_cache = self.extra_available_commands.clone();
-            if let Some(state) = session_map.get(&sid_str) {
-                let conversation = state.conversation.clone();
-                let session_id_for_update = SessionId(sid_str.clone().into());
-                task::spawn_local(async move {
-                    let Some(conversation) = conversation else {
-                        return;
-                    };
-                    // Request custom prompts
-                    let _ = conversation
-                        .submit_with_id(Submission {
-                            id: submit_id.clone(),
-                            op: Op::ListCustomPrompts,
-                        })
-                        .await;
-                    // Wait for response and then update available commands
-                    loop {
-                        match conversation.next_event().await {
-                            Ok(event) if event.id == submit_id => {
-                                match event.msg {
-                                    EventMsg::ListCustomPromptsResponse(resp) => {
-                                        // Build extra commands from custom prompts and cache them
-                                        let mut extra: Vec<AvailableCommand> = Vec::new();
-                                        for p in resp.custom_prompts {
-                                            let desc =
-                                                format!("custom prompt ({})", p.path.display());
-                                            extra.push(AvailableCommand {
-                                                name: p.name,
-                                                description: desc,
-                                                input: Some(AvailableCommandInput::Unstructured {
-                                                    hint: "Additional input (optional)".into(),
-                                                }),
-                                                meta: None,
-                                            });
-                                        }
-                                        {
-                                            let mut cache = extra_cache.borrow_mut();
-                                            *cache = extra.clone();
-                                        }
-                                        // Merge built-ins + cached extra
-                                        let mut cmds = CodexAgent::built_in_commands();
-                                        cmds.extend(extra);
-                                        let (tx, rx) = oneshot::channel();
-                                        let _ = tx_updates.send((
-                                            SessionNotification {
-                                                session_id: session_id_for_update,
-                                                update: SessionUpdate::AvailableCommandsUpdate {
-                                                    available_commands: cmds,
-                                                },
-                                                meta: None,
-                                            },
-                                            tx,
-                                        ));
-                                        let _ = rx.await;
-                                        break;
-                                    }
-                                    EventMsg::Error(_) => break,
-                                    _ => {}
-                                }
-                            }
-                            Ok(_) => continue,
-                            Err(_) => break,
-                        }
-                    }
-                });
-            }
-        }
-        Ok(NewSessionResponse {
-            session_id: SessionId(session_id.to_string().into()),
-            modes: None,
+                    SessionMode {
+                        id: SessionModeId("auto".into()),
+                        name: "Auto".to_string(),
+                        description: Some("Codex can read files, make edits, and run commands in the workspace. Codex requires approval to work outside the workspace or access network".to_string()),
+                        meta: None,
+                    },
+                    SessionMode {
+                        id: SessionModeId("full-access".into()),
+                        name: "Full Access".to_string(),
+                        description: Some("Codex can read files, make edits, and run commands with network access, without approval. Exercise caution".to_string()),
+                        meta: None,
+                    },
+                ],
+                meta: None,
+            }),
             meta: None,
         })
     }
 
     async fn load_session(&self, args: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
         info!(?args, "Received load session request");
-        // Ensure an entry exists for this session. If absent, create one similar to new_session.
-        let sid_str = args.session_id.0.to_string();
-
-        let missing = { !self.sessions.borrow().contains_key(&sid_str) };
-        if missing {
-            // Try to start a Codex conversation for this restored session as well.
-            let (conversation_id, conversation_opt) = match self
-                .conversation_manager
-                .new_conversation(self.config.clone())
-                .await
-            {
-                Ok(NewConversation {
-                    conversation_id,
-                    conversation,
-                    session_configured: _,
-                }) => (conversation_id, Some(conversation)),
-                Err(e) => {
-                    return Err(Error::into_internal_error(e));
-                }
-            };
-
-            // Track the session
-            self.sessions.borrow_mut().insert(
-                sid_str.clone(),
-                SessionState {
-                    created: SystemTime::now(),
-                    conversation_id: conversation_id.to_string(),
-                    conversation: conversation_opt,
-                    current_approval: AskForApproval::OnRequest,
-                    current_sandbox: SandboxPolicy::new_workspace_write_policy(),
-                    token_usage: None,
-                },
-            );
-
-            // Immediately advertise available commands to the client
-            {
-                let available_commands = self.available_commands();
-                let session_id_for_update = args.session_id.clone();
-                let tx_updates = self.session_update_tx.clone();
-                task::spawn_local(async move {
-                    let (tx, rx) = oneshot::channel();
-                    let _ = tx_updates.send((
-                        SessionNotification {
-                            session_id: session_id_for_update,
-                            update: SessionUpdate::AvailableCommandsUpdate { available_commands },
-                            meta: None,
-                        },
-                        tx,
-                    ));
-                    let _ = rx.await;
-                });
-            }
-
-            // Discover custom prompts and refresh available commands (same as in new_session)
-            {
-                let sid = sid_str.clone();
-                let tx_updates = self.session_update_tx.clone();
-                let submit_seq = self.next_submit_seq.get();
-                self.next_submit_seq.set(submit_seq + 1);
-                let submit_id = format!("s{}-{}", sid, submit_seq);
-                let session_map = self.sessions.borrow();
-                let extra_cache = self.extra_available_commands.clone();
-                if let Some(state) = session_map.get(&sid) {
-                    let conversation = state.conversation.clone();
-                    let session_id_for_update = args.session_id.clone();
-                    task::spawn_local(async move {
-                        let Some(conversation) = conversation else {
-                            return;
-                        };
-                        let _ = conversation
-                            .submit_with_id(Submission {
-                                id: submit_id.clone(),
-                                op: Op::ListCustomPrompts,
-                            })
-                            .await;
-                        loop {
-                            match conversation.next_event().await {
-                                Ok(event) if event.id == submit_id => match event.msg {
-                                    EventMsg::ListCustomPromptsResponse(resp) => {
-                                        let mut extra: Vec<AvailableCommand> = Vec::new();
-                                        for p in resp.custom_prompts {
-                                            let desc =
-                                                format!("custom prompt ({})", p.path.display());
-                                            extra.push(AvailableCommand {
-                                                name: p.name,
-                                                description: desc,
-                                                input: Some(AvailableCommandInput::Unstructured {
-                                                    hint: "Additional input (optional)".into(),
-                                                }),
-                                                meta: None,
-                                            });
-                                        }
-                                        {
-                                            let mut cache = extra_cache.borrow_mut();
-                                            *cache = extra.clone();
-                                        }
-                                        let mut cmds = CodexAgent::built_in_commands();
-                                        cmds.extend(extra.into_iter());
-                                        let (tx, rx) = oneshot::channel();
-                                        let _ = tx_updates.send((
-                                            SessionNotification {
-                                                session_id: session_id_for_update,
-                                                update: SessionUpdate::AvailableCommandsUpdate {
-                                                    available_commands: cmds,
-                                                },
-                                                meta: None,
-                                            },
-                                            tx,
-                                        ));
-                                        let _ = rx.await;
-                                        break;
-                                    }
-                                    EventMsg::Error(_) => break,
-                                    _ => {}
-                                },
-                                Ok(_) => continue,
-                                Err(_) => break,
-                            }
-                        }
-                    });
-                }
-            }
-        } else {
-            // Even if the session exists, re-emit available commands so the client UI can hydrate.
-            let available_commands = self.available_commands();
-            let session_id_for_update = args.session_id.clone();
-            let tx_updates = self.session_update_tx.clone();
-            task::spawn_local(async move {
-                let (tx, rx) = oneshot::channel();
-                let _ = tx_updates.send((
-                    SessionNotification {
-                        session_id: session_id_for_update,
-                        update: SessionUpdate::AvailableCommandsUpdate { available_commands },
-                        meta: None,
-                    },
-                    tx,
-                ));
-                let _ = rx.await;
-            });
-        }
-
         Ok(LoadSessionResponse {
             modes: None,
             meta: None,
@@ -543,19 +325,11 @@ impl Agent for CodexAgent {
 
     async fn prompt(&self, args: PromptRequest) -> Result<PromptResponse, Error> {
         info!(?args, "Received prompt request");
-        let sid = args.session_id.0.to_string();
-        if !self.sessions.borrow().contains_key(&sid) {
-            warn!(session_id = %sid, "unknown session_id");
-            return Err(Error::invalid_params());
-        }
-
-        let sid_str = args.session_id.0.to_string();
-        let session = self
-            .sessions
-            .borrow()
-            .get(&sid_str)
-            .cloned()
-            .ok_or_else(Error::invalid_params)?;
+        let session_id = args.session_id.0.to_string();
+        let session = match self.sessions.borrow().get(&session_id) {
+            Some(s) => s.clone(),
+            None => return Err(Error::invalid_params()),
+        };
 
         // Handle slash commands (e.g., "/status") when the first block is text starting with '/'
         if let Some(ContentBlock::Text(t)) = args.prompt.first() {
@@ -577,14 +351,8 @@ impl Agent for CodexAgent {
         }
 
         // Ensure we have a Codex conversation for non-slash content.
-        if self
-            .sessions
-            .borrow()
-            .get(&sid_str)
-            .and_then(|s| s.conversation.as_ref())
-            .is_none()
-        {
-            let msg = "No Codex backend available (dev mock). Use slash commands like /status";
+        if session.conversation.as_ref().is_none() {
+            let msg = "No Codex backend available. Use slash commands like /status";
             let (tx, rx) = oneshot::channel();
             self.send_message_chunk(&args.session_id, msg.into(), tx)?;
             let _ = rx.await;
@@ -593,12 +361,6 @@ impl Agent for CodexAgent {
                 meta: None,
             });
         }
-        let conversation = self
-            .sessions
-            .borrow()
-            .get(&sid_str)
-            .and_then(|s| s.conversation.clone())
-            .unwrap();
 
         // Build user input submission items from prompt content blocks.
         let mut items: Vec<InputItem> = Vec::new();
@@ -630,17 +392,11 @@ impl Agent for CodexAgent {
                 }
             }
         }
-        let submit_id = format!("s{}-{}", sid_str, self.next_submit_seq.get());
-        self.next_submit_seq.set(self.next_submit_seq.get() + 1);
 
-        let submission = Submission {
-            id: submit_id.clone(),
-            op: Op::UserInput { items },
-        };
-
+        let conversation = session.conversation.clone().unwrap();
         // Enqueue work and then stream corresponding events back as ACP updates.
-        conversation
-            .submit_with_id(submission)
+        let submit_id = conversation
+            .submit(Op::UserInput { items })
             .await
             .map_err(Error::into_internal_error)?;
 
@@ -871,34 +627,28 @@ impl Agent for CodexAgent {
                         meta: None,
                     };
 
-                    let reqp = RequestPermissionRequest {
+                    let permission_req = RequestPermissionRequest {
                         session_id: args.session_id.clone(),
                         tool_call: update,
                         options: pos.as_ref().clone(),
                         meta: None,
                     };
+
                     let (txp, rxp) = oneshot::channel();
-                    let _ = self.client_tx.send(ClientOp::RequestPermission(reqp, txp));
+                    let _ = self
+                        .client_tx
+                        .send(ClientOp::RequestPermission(permission_req, txp));
                     let outcome = rxp.await.map_err(|_| Error::internal_error())?;
                     if let Ok(resp) = outcome {
                         let decision = self.handle_response_outcome(resp);
                         // Send ExecApproval back to Codex; refer to current event.id
-                        let approval_submit_id =
-                            format!("perm-{}-{}", sid_str, self.next_submit_seq.get());
-                        self.next_submit_seq.set(self.next_submit_seq.get() + 1);
-                        if let Some(conv) = session.conversation.as_ref() {
-                            conv.submit_with_id(Submission {
-                                id: approval_submit_id,
-                                op: Op::ExecApproval {
-                                    id: event.id.clone(),
-                                    decision,
-                                },
+                        conversation
+                            .submit(Op::ExecApproval {
+                                id: event.id.clone(),
+                                decision,
                             })
                             .await
                             .map_err(Error::into_internal_error)?;
-                        } else {
-                            warn!("Dev mock mode: ExecApproval ignored (no backend)");
-                        }
                     }
                 }
                 EventMsg::ApplyPatchApprovalRequest(req) => {
@@ -948,28 +698,19 @@ impl Agent for CodexAgent {
                     let outcome = rxp.await.map_err(|_| Error::internal_error())?;
                     if let Ok(resp) = outcome {
                         let decision = self.handle_response_outcome(resp);
-                        let approval_submit_id =
-                            format!("perm-{}-{}", sid_str, self.next_submit_seq.get());
-                        self.next_submit_seq.set(self.next_submit_seq.get() + 1);
-                        if let Some(conv) = session.conversation.as_ref() {
-                            conv.submit_with_id(Submission {
-                                id: approval_submit_id,
-                                op: Op::PatchApproval {
-                                    id: event.id.clone(),
-                                    decision,
-                                },
+                        conversation
+                            .submit(Op::PatchApproval {
+                                id: event.id.clone(),
+                                decision,
                             })
                             .await
                             .map_err(Error::into_internal_error)?;
-                        } else {
-                            warn!("Dev mock mode: PatchApproval ignored (no backend)");
-                        }
                     }
                 }
                 EventMsg::TokenCount(tc) => {
                     if let Some(info) = tc.info
                         && let Ok(mut map) = self.sessions.try_borrow_mut()
-                        && let Some(state) = map.get_mut(&sid_str)
+                        && let Some(state) = map.get_mut(&session_id)
                     {
                         state.token_usage = Some(info.total_token_usage.clone());
                     }
@@ -996,12 +737,14 @@ impl Agent for CodexAgent {
 
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
         info!(?args, "Received cancel request");
-        let sid_str = args.session_id.0.to_string();
+        let session_id = args.session_id.0.to_string();
         // If we have an active Codex conversation, forward an interrupt.
         // Avoid holding a RefCell borrow across await by scoping the borrow.
         let conv_opt = {
             let sessions = self.sessions.borrow();
-            sessions.get(&sid_str).and_then(|s| s.conversation.clone())
+            sessions
+                .get(&session_id)
+                .and_then(|s| s.conversation.clone())
         };
         if let Some(conv) = conv_opt {
             // Best-effort: we don't need the submission id here.
