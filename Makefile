@@ -13,10 +13,6 @@ run:
 	RUST_LOG?=info
 	RUST_LOG=$(RUST_LOG) $(CARGO) run --quiet
 
-run-mock:
-	RUST_LOG?=info
-	ACP_DEV_ALLOW_MOCK=1 RUST_LOG=$(RUST_LOG) $(CARGO) run --quiet
-
 fmt:
 	$(CARGO) fmt --all
 

@@ -20,9 +20,6 @@ An Agent Client Protocol (ACP)–compatible agent that bridges the OpenAI Codex 
 - Rust (Rust 2024 edition; rustc 1.89+ as pinned in `rust-toolchain.toml`).
 - Network access for building Git dependencies (Codex workspace, ACP crate).
 
-Optional for development:
-- To run without Codex backend (for ACP flow testing), set `ACP_DEV_ALLOW_MOCK=1` to enable a mock session that supports slash commands like `/status` but does not call the Codex backend.
-
 ## Build
 
 ```bash
@@ -94,6 +91,10 @@ make smoke
     - `/model` — Show or set the current model (uses `Op::OverrideTurnContext`).
     - `/approvals` — Set approval mode (`untrusted | on-request | on-failure | never`).
     - `/status` — Rich status (workspace, account, model, token usage).
+    - `/compact` — Summarize conversation to prevent hitting the context limit.
+    - `/review` — Review current changes and find issues.
+    - `/new` — Start a new chat during a conversation.
+    - `/quit` — Exit Codex agent. Shows a goodbye message and requests backend shutdown if available.
 
 - Available commands with custom prompts
   - On new session the agent first advertises built-in commands.
