@@ -1,6 +1,6 @@
 [package]
 name = "codex-acp-agent"
-authors = ["<soddygo@gmail.com>"]
+authors = ["<soddygo@qq.com>"]
 version = "0.1.0"
 edition = "2024"
 description = "ACP-compatible agent that bridges the OpenAI Codex runtime with ACP clients over stdio."
