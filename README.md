@@ -13,7 +13,7 @@ An Agent Client Protocol (ACP)–compatible agent that bridges the OpenAI Codex 
 - Integrates with the Codex Rust workspace for conversation management and event streaming.
 - Slash commands with ACP AvailableCommands updates (advertised to clients on session start).
 - Status output tailored for IDEs (workspace, account, model, token usage).
-- Discovers custom prompts via `Op::ListCustomPrompts` and advertises them as commands.
+- Supports ACP session modes: `read-only`, `auto` (default), and `full-access`.
 
 ## Requirements
 
@@ -33,6 +33,12 @@ The agent communicates over stdin/stdout using ACP JSON-RPC. Launch it and conne
 ```bash
 # With tracing logs
 RUST_LOG=info cargo run --quiet
+```
+
+To run without a Codex backend (slash-commands only), enable mock mode:
+
+```bash
+ACP_DEV_ALLOW_MOCK=1 RUST_LOG=info cargo run --quiet
 ```
 
 Because this agent speaks on stdio, it is intended to be spawned by your client. For manual testing, you can pipe ACP JSON-RPC messages to stdin and read replies from stdout.
@@ -82,7 +88,7 @@ make smoke
 ## Features
 
 - ACP Agent implementation
-  - Handles `initialize`, `authenticate` (no-op for now), `session/new`, `session/prompt`, `session/cancel`.
+  - Handles `initialize`, `authenticate` (API key), `session/new`, `session/prompt`, `session/cancel`.
   - Streams Codex events (assistant text and deltas, reasoning deltas, token counts) as `session/update` notifications.
 
 - Slash commands (advertised via `AvailableCommandsUpdate`)
@@ -96,9 +102,9 @@ make smoke
     - `/new` — Start a new chat during a conversation.
     - `/quit` — Exit Codex agent. Shows a goodbye message and requests backend shutdown if available.
 
-- Available commands with custom prompts
-  - On new session the agent first advertises built-in commands.
-  - It then requests `Op::ListCustomPrompts` from Codex and advertises discovered prompts as additional commands (name + path in description). These are discoverable in client popups that read `available_commands_update`.
+- Session modes
+  - Advertises `read-only`, `auto` (current), and `full-access` on new session.
+  - Clients may switch modes via ACP `session/setMode`; the agent emits `CurrentModeUpdate`.
 
 ## Status Output (`/status`)
 
@@ -132,6 +138,11 @@ The `/status` command prints a human-friendly summary, e.g.:
 Notes
 - Some fields may be unknown depending on your auth mode and environment.
 - Token counts are aggregated from Codex `EventMsg::TokenCount` when available.
+
+## Authentication
+
+- Use `codex login` (ChatGPT) or set `OPENAI_API_KEY` for API-key mode.
+- The agent currently implements `authenticate` for the API key method; ChatGPT sign-in is surfaced via initialization metadata and handled by Codex core.
 
 ## Development
 
