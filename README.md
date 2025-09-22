@@ -13,15 +13,12 @@ An Agent Client Protocol (ACP)–compatible agent that bridges the OpenAI Codex 
 - Integrates with the Codex Rust workspace for conversation management and event streaming.
 - Slash commands with ACP AvailableCommands updates (advertised to clients on session start).
 - Status output tailored for IDEs (workspace, account, model, token usage).
-- Discovers custom prompts via `Op::ListCustomPrompts` and advertises them as commands.
+- Supports ACP session modes: `read-only`, `auto` (default), and `full-access`.
 
 ## Requirements
 
 - Rust (Rust 2024 edition; rustc 1.89+ as pinned in `rust-toolchain.toml`).
 - Network access for building Git dependencies (Codex workspace, ACP crate).
-
-Optional for development:
-- To run without Codex backend (for ACP flow testing), set `ACP_DEV_ALLOW_MOCK=1` to enable a mock session that supports slash commands like `/status` but does not call the Codex backend.
 
 ## Build
 
@@ -85,7 +82,7 @@ make smoke
 ## Features
 
 - ACP Agent implementation
-  - Handles `initialize`, `authenticate` (no-op for now), `session/new`, `session/prompt`, `session/cancel`.
+  - Handles `initialize`, `authenticate` (API key), `session/new`, `session/prompt`, `session/cancel`.
   - Streams Codex events (assistant text and deltas, reasoning deltas, token counts) as `session/update` notifications.
 
 - Slash commands (advertised via `AvailableCommandsUpdate`)
@@ -94,10 +91,14 @@ make smoke
     - `/model` — Show or set the current model (uses `Op::OverrideTurnContext`).
     - `/approvals` — Set approval mode (`untrusted | on-request | on-failure | never`).
     - `/status` — Rich status (workspace, account, model, token usage).
+    - `/compact` — Summarize conversation to prevent hitting the context limit.
+    - `/review` — Review current changes and find issues.
+    - `/new` — Start a new chat during a conversation.
+    - `/quit` — Exit Codex agent. Shows a goodbye message and requests backend shutdown if available.
 
-- Available commands with custom prompts
-  - On new session the agent first advertises built-in commands.
-  - It then requests `Op::ListCustomPrompts` from Codex and advertises discovered prompts as additional commands (name + path in description). These are discoverable in client popups that read `available_commands_update`.
+- Session modes
+  - Advertises `read-only`, `auto` (current), and `full-access` on new session.
+  - Clients may switch modes via ACP `session/setMode`; the agent emits `CurrentModeUpdate`.
 
 ## Status Output (`/status`)
 

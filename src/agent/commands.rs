@@ -1,63 +1,58 @@
 use super::*;
 use agent_client_protocol::{AvailableCommand, AvailableCommandInput};
-use codex_core::protocol::{AskForApproval, EventMsg, Op, SandboxPolicy, Submission};
+use codex_core::{
+    NewConversation,
+    protocol::{AskForApproval, Op, ReviewRequest, SandboxPolicy},
+};
 use std::{fs, io};
 use tokio::sync::oneshot;
 
 impl CodexAgent {
-    pub fn built_in_commands() -> Vec<AvailableCommand> {
-        vec![
-            AvailableCommand {
-                name: "init".into(),
-                description: "create an AGENTS.md file with instructions for Codex".into(),
-                input: None,
-                meta: None,
-            },
-            AvailableCommand {
-                name: "model".into(),
-                description: "choose what model and reasoning effort to use".into(),
-                input: Some(AvailableCommandInput::Unstructured {
-                    hint: "Model slug, e.g., gpt-codex".into(),
-                }),
-                meta: None,
-            },
-            AvailableCommand {
-                name: "approvals".into(),
-                description: "choose what Codex can do without approval".into(),
-                input: Some(AvailableCommandInput::Unstructured {
-                    hint: "untrusted|on-request|on-failure|never".into(),
-                }),
-                meta: None,
-            },
-            AvailableCommand {
-                name: "status".into(),
-                description: "show current session configuration and token usage".into(),
-                input: None,
-                meta: None,
-            },
-        ]
-    }
-
-    pub fn available_commands(&self) -> Vec<AvailableCommand> {
-        let mut cmds = Self::built_in_commands();
-        cmds.extend(self.extra_available_commands.borrow().iter().cloned());
-        cmds
-    }
-
     pub async fn handle_slash_command(
         &self,
-        session_id: &SessionId,
+        session_id: &acp::SessionId,
         name: &str,
         _rest: &str,
     ) -> Result<bool, Error> {
         let sid_str = session_id.0.to_string();
-        let session = match self.sessions.borrow().get(&sid_str) {
+        let mut session = match self.sessions.borrow().get(&sid_str) {
             Some(s) => s.clone(),
             None => return Err(Error::invalid_params()),
         };
 
         // Commands implemented inline (no Codex submission needed)
         match name {
+            "new" => {
+                // Start a new conversation within the current session
+                let (conversation_id, conversation_opt, _session_configured) = match self
+                    .conversation_manager
+                    .new_conversation(self.config.clone())
+                    .await
+                {
+                    Ok(NewConversation {
+                        conversation_id,
+                        conversation,
+                        session_configured,
+                    }) => (conversation_id, Some(conversation), session_configured),
+                    Err(e) => {
+                        let msg = format!("Failed to start new conversation: {}", e);
+                        let (tx, rx) = oneshot::channel();
+                        self.send_message_chunk(session_id, msg.into(), tx)?;
+                        let _ = rx.await;
+                        return Ok(true);
+                    }
+                };
+
+                // Update the session with the new conversation
+                session.conversation_id = conversation_id.to_string();
+                session.conversation = conversation_opt;
+                self.sessions.borrow_mut().insert(sid_str, session);
+
+                let (tx, rx) = oneshot::channel();
+                self.send_message_chunk(session_id, "✨ Started a new conversation".into(), tx)?;
+                let _ = rx.await;
+                return Ok(true);
+            }
             "init" => {
                 // Create AGENTS.md in the current workspace if it doesn't already exist.
                 let rest = _rest.trim();
@@ -154,8 +149,6 @@ Notes for Agents
                 }
 
                 // Request Codex to change the model for subsequent turns.
-                let submit_id = format!("s{}-{}", sid_str, self.next_submit_seq.get());
-                self.next_submit_seq.set(self.next_submit_seq.get() + 1);
                 let op = Op::OverrideTurnContext {
                     cwd: None,
                     approval_policy: None,
@@ -165,11 +158,9 @@ Notes for Agents
                     summary: None,
                 };
                 if let Some(conv) = session.conversation.as_ref() {
-                    conv.submit_with_id(Submission { id: submit_id, op })
-                        .await
-                        .map_err(Error::into_internal_error)?;
+                    conv.submit(op).await.map_err(Error::into_internal_error)?;
                 } else {
-                    let msg = "Dev mock mode: /model not available without Codex backend";
+                    let msg = "/model not available without Codex backend";
                     let (tx, rx) = oneshot::channel();
                     self.send_message_chunk(session_id, msg.into(), tx)?;
                     let _ = rx.await;
@@ -200,132 +191,132 @@ Notes for Agents
                     }
                 };
 
-                if let Some(policy) = parsed {
-                    let submit_id = format!("s{}-{}", sid_str, self.next_submit_seq.get());
-                    self.next_submit_seq.set(self.next_submit_seq.get() + 1);
-                    let op = Op::OverrideTurnContext {
-                        cwd: None,
-                        approval_policy: Some(policy),
-                        sandbox_policy: None,
-                        model: None,
-                        effort: None,
-                        summary: None,
-                    };
+                return if let Some(policy) = parsed {
                     if let Some(conv) = session.conversation.as_ref() {
-                        conv.submit_with_id(Submission { id: submit_id, op })
-                            .await
-                            .map_err(Error::into_internal_error)?;
-                    } else {
-                        let msg = "Dev mock mode: /approvals requires Codex backend";
+                        let submit_result = conv
+                            .submit(Op::OverrideTurnContext {
+                                cwd: None,
+                                approval_policy: Some(policy),
+                                sandbox_policy: None,
+                                model: None,
+                                effort: None,
+                                summary: None,
+                            })
+                            .await;
+
+                        if let Err(e) = submit_result {
+                            let (tx, rx) = oneshot::channel();
+                            self.send_message_chunk(
+                                session_id,
+                                format!("Failed to set approval policy: {}", e).into(),
+                                tx,
+                            )?;
+                            let _ = rx.await;
+                            return Ok(true);
+                        }
+
+                        // Persist our local view of the policy for /status
+                        if let Ok(mut map) = self.sessions.try_borrow_mut()
+                            && let Some(state) = map.get_mut(&sid_str)
+                        {
+                            state.current_approval = policy;
+                        }
+
+                        let msg = format!("Approval policy set to: {}", value);
                         let (tx, rx) = oneshot::channel();
                         self.send_message_chunk(session_id, msg.into(), tx)?;
                         let _ = rx.await;
-                        return Ok(true);
+                        Ok(true)
+                    } else {
+                        let msg = "Approval policy cannot be set: Codex backend is not available.";
+                        let (tx, rx) = oneshot::channel();
+                        self.send_message_chunk(session_id, msg.into(), tx)?;
+                        let _ = rx.await;
+                        Ok(true)
                     }
-                    // Persist our local view of the policy for /status
-                    if let Ok(mut map) = self.sessions.try_borrow_mut()
-                        && let Some(state) = map.get_mut(&sid_str)
-                    {
-                        state.current_approval = policy;
-                    }
-                    let msg = format!("Approval policy set to: {}", value);
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(session_id, msg.into(), tx)?;
-                    let _ = rx.await;
                 } else {
                     // show current (best-effort from config)
                     let msg = "Current approval policy: configured per session. Use /approvals <policy> to set.";
                     let (tx, rx) = oneshot::channel();
                     self.send_message_chunk(session_id, msg.into(), tx)?;
                     let _ = rx.await;
-                }
-                return Ok(true);
+                    Ok(true)
+                };
             }
-            _ => {}
-        }
+            "compact" => {
+                session.token_usage = None;
+                let compact_msg = "🧠 Compacting conversation to reduce context size...";
+                if let Some(conv) = session.conversation.as_ref() {
+                    let submit_result = conv.submit(Op::Compact).await;
+                    if let Err(e) = submit_result {
+                        let (tx, rx) = oneshot::channel();
+                        self.send_message_chunk(
+                            session_id,
+                            format!("Failed to submit compact: {}", e).into(),
+                            tx,
+                        )?;
+                        let _ = rx.await;
+                        return Ok(true);
+                    }
+                    let (tx, rx) = oneshot::channel();
+                    self.send_message_chunk(session_id, compact_msg.into(), tx)?;
+                    let _ = rx.await;
+                    return Ok(true);
+                }
+            }
+            "review" => {
+                session.token_usage = None;
+                let review_msg = "🔍 Asking Codex to review current changes...";
+                if let Some(conv) = session.conversation.as_ref() {
+                    let submit_result = conv
+                        .submit(Op::Review {
+                            review_request: ReviewRequest {
+                                prompt: "review current changes".to_string(),
+                                user_facing_hint: "current changes".to_string(),
+                            },
+                        })
+                        .await;
+                    if let Err(e) = submit_result {
+                        let (tx, rx) = oneshot::channel();
+                        self.send_message_chunk(
+                            session_id,
+                            format!("Failed to submit review: {}", e).into(),
+                            tx,
+                        )?;
+                        let _ = rx.await;
+                        return Ok(true);
+                    }
 
-        // Commands forwarded to Codex as protocol Ops
-        let op = match name {
-            "compact" => Some(Op::Compact),
-            "list-tools" | "tools" => Some(Op::ListMcpTools),
-            "list-custom-prompts" | "prompts" => Some(Op::ListCustomPrompts),
-            "history" => Some(Op::GetHistory),
-            "shutdown" => Some(Op::Shutdown),
-            _ => None,
-        };
-
-        if let Some(op) = op {
-            let submit_id = format!("s{}-{}", sid_str, self.next_submit_seq.get());
-            self.next_submit_seq.set(self.next_submit_seq.get() + 1);
-            if let Some(conv) = session.conversation.as_ref() {
-                conv.submit_with_id(Submission {
-                    id: submit_id.clone(),
-                    op,
-                })
-                .await
-                .map_err(Error::into_internal_error)?;
-            } else {
-                let msg = "Dev mock mode: command requires Codex backend";
+                    let (tx, rx) = oneshot::channel();
+                    self.send_message_chunk(session_id, review_msg.into(), tx)?;
+                    let _ = rx.await;
+                    return Ok(true);
+                }
+            }
+            "quit" => {
+                // Say goodbye and submit Shutdown to Codex if available
+                let quit_msg = "👋 Codex agent is shutting down. Goodbye!";
+                if let Some(conv) = session.conversation.as_ref() {
+                    // Request backend shutdown
+                    let submit_result = conv.submit(Op::Shutdown).await;
+                    if let Err(e) = submit_result {
+                        let (tx, rx) = oneshot::channel();
+                        self.send_message_chunk(
+                            session_id,
+                            format!("Failed to submit shutdown: {}", e).into(),
+                            tx,
+                        )?;
+                        let _ = rx.await;
+                        return Ok(true);
+                    }
+                }
+                // Send the goodbye message
                 let (tx, rx) = oneshot::channel();
-                self.send_message_chunk(session_id, msg.into(), tx)?;
+                self.send_message_chunk(session_id, quit_msg.into(), tx)?;
                 let _ = rx.await;
                 return Ok(true);
             }
-
-            // Stream events for this submission using the same loop as in prompt
-            let mut saw_message_delta = false;
-
-            loop {
-                let event = session
-                    .conversation
-                    .as_ref()
-                    .unwrap()
-                    .next_event()
-                    .await
-                    .map_err(Error::into_internal_error)?;
-                if event.id != submit_id {
-                    continue;
-                }
-                match event.msg {
-                    EventMsg::AgentMessageDelta(delta) => {
-                        let chunk = Self::normalize_stream_chunk(delta.delta);
-                        saw_message_delta = true;
-                        let (tx, rx) = oneshot::channel();
-                        self.session_update_tx
-                            .send((
-                                SessionNotification {
-                                    session_id: session_id.clone(),
-                                    update: SessionUpdate::AgentMessageChunk {
-                                        content: chunk.into(),
-                                    },
-                                    meta: None,
-                                },
-                                tx,
-                            ))
-                            .map_err(Error::into_internal_error)?;
-                        let _ = rx.await;
-                    }
-                    EventMsg::AgentMessage(msg) => {
-                        if saw_message_delta {
-                            continue;
-                        }
-                        let (tx, rx) = oneshot::channel();
-                        self.send_message_chunk(session_id, msg.message.into(), tx)?;
-                        let _ = rx.await;
-                    }
-                    EventMsg::TaskComplete(_) | EventMsg::ShutdownComplete => {
-                        break;
-                    }
-                    EventMsg::Error(err) => {
-                        let (tx, rx) = oneshot::channel();
-                        self.send_message_chunk(session_id, err.message.into(), tx)?;
-                        let _ = rx.await;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            return Ok(true);
+            _ => {}
         }
         Ok(false)
     }
@@ -339,7 +330,7 @@ Notes for Agents
                     state.current_approval,
                     state.current_sandbox.clone(),
                     state.token_usage.clone(),
-                    state.conversation_id.clone(),
+                    state.conversation_id.to_string(),
                 )
             } else {
                 (
@@ -357,7 +348,11 @@ Notes for Agents
         let agents_line = if agents_files.is_empty() {
             "(none)".to_string()
         } else {
-            agents_files.join(", ")
+            agents_files
+                .iter()
+                .map(|f| self.shorten_home(&self.config.cwd.join(f)))
+                .collect::<Vec<_>>()
+                .join(", ")
         };
 
         // Account
@@ -392,17 +387,59 @@ Notes for Agents
         // Model
         let model = &self.config.model;
         let provider = self.title_case(&self.config.model_provider_id);
-        let effort = format!("{}", self.config.model_reasoning_effort);
-        let summary = format!("{}", self.config.model_reasoning_summary);
+        let effort = self.title_case(format!("{:?}", self.config.model_reasoning_effort).as_str());
+        let summary = self.title_case(format!("{}", self.config.model_reasoning_summary).as_str());
 
         // Tokens
         let (input, output, total) = match token_usage {
-            Some(u) => (u.input_tokens, u.output_tokens, u.total_tokens),
-            None => (0, 0, 0),
+            Some(u) => (
+                u.input_tokens.to_string(),
+                u.output_tokens.to_string(),
+                u.total_tokens.to_string(),
+            ),
+            None => ("0".to_string(), "0".to_string(), "0".to_string()),
         };
 
-        format!(
-            "📂 Workspace\n  • Path: {cwd}\n  • Approval Mode: {approval}\n  • Sandbox: {sandbox}\n  • AGENTS files: {agents}\n\n👤 Account\n  • Signed in with {auth_mode}\n  • Login: {email}\n  • Plan: {plan}\n\n🧠 Model\n  • Name: {model}\n  • Provider: {provider}\n  • Reasoning Effort: {effort}\n  • Reasoning Summaries: {summary}\n\n📊 Token Usage\n  • Session ID: {sid}\n  • Input: {input}\n  • Output: {output}\n  • Total: {total}",
+        let status = format!(
+            r#"
+📂 Workspace
+
+    Path:           {cwd}
+
+    Approval Mode:  {approval}
+
+    Sandbox:        {sandbox}
+
+    AGENTS files:   {agents}
+
+👤 Account
+
+    Signed in with: {auth_mode}
+
+    Login:          {email}
+
+    Plan:           {plan}
+
+🧠 Model
+
+    Name:               {model}
+
+    Provider:           {provider}
+
+    Reasoning Effort:   {effort}
+
+    Reasoning Summaries:{summary}
+
+📊 Token Usage
+
+    Session ID:     {sid}
+
+    Input:          {input}
+
+    Output:         {output}
+
+    Total:          {total}
+"#,
             cwd = cwd,
             approval = approval_mode,
             sandbox = sandbox_mode,
@@ -412,13 +449,14 @@ Notes for Agents
             plan = plan,
             model = model,
             provider = provider,
-            effort = self.title_case(&effort),
-            summary = self.title_case(&summary),
+            effort = effort,
+            summary = summary,
             sid = session_uuid,
             input = input,
             output = output,
             total = total,
-        )
+        );
+        status
     }
 
     fn shorten_home(&self, p: &std::path::Path) -> String {
@@ -452,4 +490,61 @@ Notes for Agents
         let rest = chars.as_str();
         format!("{}{}", first, rest)
     }
+}
+
+pub fn built_in_commands() -> Vec<AvailableCommand> {
+    vec![
+        AvailableCommand {
+            name: "new".into(),
+            description: "start a new chat during a conversation".into(),
+            input: None,
+            meta: None,
+        },
+        AvailableCommand {
+            name: "init".into(),
+            description: "create an AGENTS.md file with instructions for Codex".into(),
+            input: None,
+            meta: None,
+        },
+        AvailableCommand {
+            name: "compact".into(),
+            description: "summarize conversation to prevent hitting the context limit".into(),
+            input: None,
+            meta: None,
+        },
+        AvailableCommand {
+            name: "review".into(),
+            description: "review my current changes and find issues".to_string(),
+            input: None,
+            meta: None,
+        },
+        AvailableCommand {
+            name: "model".into(),
+            description: "choose what model and reasoning effort to use".into(),
+            input: Some(AvailableCommandInput::Unstructured {
+                hint: "Model slug, e.g., gpt-codex".into(),
+            }),
+            meta: None,
+        },
+        AvailableCommand {
+            name: "approvals".into(),
+            description: "choose what Codex can do without approval".into(),
+            input: Some(AvailableCommandInput::Unstructured {
+                hint: "untrusted|on-request|on-failure|never".into(),
+            }),
+            meta: None,
+        },
+        AvailableCommand {
+            name: "status".into(),
+            description: "show current session configuration and token usage".into(),
+            input: None,
+            meta: None,
+        },
+        AvailableCommand {
+            name: "quit".into(),
+            description: "exit Codex".into(),
+            input: None,
+            meta: None,
+        },
+    ]
 }
