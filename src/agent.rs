@@ -4,19 +4,7 @@ use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
-use agent_client_protocol::{
-    Agent, AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
-    AvailableCommand, CancelNotification, ClientCapabilities, ContentBlock,
-    EmbeddedResourceResource, Error, ExtNotification, ExtRequest, ExtResponse, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionId,
-    PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionId,
-    SessionMode, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionModeRequest, SetSessionModeResponse, StopReason, ToolCall, ToolCallContent,
-    ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-    V1,
-};
+use agent_client_protocol::{self as acp, Agent, Error, V1};
 use codex_core::{
     config::Config as CodexConfig, protocol::{
         AskForApproval, EventMsg, InputItem, Op, ReviewDecision, SandboxPolicy, TokenUsage,
@@ -44,19 +32,19 @@ struct SessionState {
 }
 
 pub struct CodexAgent {
-    session_update_tx: mpsc::UnboundedSender<(SessionNotification, Sender<()>)>,
+    session_update_tx: mpsc::UnboundedSender<(acp::SessionNotification, Sender<()>)>,
     sessions: Rc<RefCell<HashMap<String, SessionState>>>,
     config: CodexConfig,
     conversation_manager: ConversationManager,
     auth_manager: Arc<RwLock<Arc<AuthManager>>>,
-    available_commands: Vec<AvailableCommand>,
+    available_commands: Vec<acp::AvailableCommand>,
     client_tx: mpsc::UnboundedSender<ClientOp>,
-    client_capabilities: RefCell<ClientCapabilities>,
+    client_capabilities: RefCell<acp::ClientCapabilities>,
 }
 
 impl CodexAgent {
     pub fn with_config(
-        session_update_tx: mpsc::UnboundedSender<(SessionNotification, Sender<()>)>,
+        session_update_tx: mpsc::UnboundedSender<(acp::SessionNotification, Sender<()>)>,
         client_tx: mpsc::UnboundedSender<ClientOp>,
         config: CodexConfig,
     ) -> Self {
@@ -77,15 +65,15 @@ impl CodexAgent {
 
     pub fn send_message_chunk(
         &self,
-        session_id: &SessionId,
-        content: ContentBlock,
+        session_id: &acp::SessionId,
+        content: acp::ContentBlock,
         tx: Sender<()>,
     ) -> Result<(), Error> {
         self.session_update_tx
             .send((
-                SessionNotification {
+                acp::SessionNotification {
                     session_id: session_id.clone(),
-                    update: SessionUpdate::AgentMessageChunk { content },
+                    update: acp::SessionUpdate::AgentMessageChunk { content },
                     meta: None,
                 },
                 tx,
@@ -94,9 +82,9 @@ impl CodexAgent {
         Ok(())
     }
 
-    fn handle_response_outcome(&self, resp: RequestPermissionResponse) -> ReviewDecision {
+    fn handle_response_outcome(&self, resp: acp::RequestPermissionResponse) -> ReviewDecision {
         match resp.outcome {
-            RequestPermissionOutcome::Selected { option_id } => {
+            acp::RequestPermissionOutcome::Selected { option_id } => {
                 if option_id.0.as_ref() == "approve" {
                     ReviewDecision::Approved
                 } else if option_id.0.as_ref() == "approve_for_session" {
@@ -105,7 +93,7 @@ impl CodexAgent {
                     ReviewDecision::Denied
                 }
             }
-            RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
+            acp::RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
         }
     }
 
@@ -123,47 +111,50 @@ impl CodexAgent {
 #[derive(Debug)]
 pub enum ClientOp {
     RequestPermission(
-        RequestPermissionRequest,
-        Sender<Result<RequestPermissionResponse, Error>>,
+        acp::RequestPermissionRequest,
+        Sender<Result<acp::RequestPermissionResponse, Error>>,
     ),
 }
 
 #[async_trait::async_trait(?Send)]
 impl Agent for CodexAgent {
-    async fn initialize(&self, args: InitializeRequest) -> Result<InitializeResponse, Error> {
+    async fn initialize(
+        &self,
+        args: acp::InitializeRequest,
+    ) -> Result<acp::InitializeResponse, Error> {
         info!(?args, "Received initialize request");
         // Advertise supported auth methods. We surface both ChatGPT and API key.
         let auth_methods = vec![
-            AuthMethod {
-                id: AuthMethodId("chatgpt".into()),
+            acp::AuthMethod {
+                id: acp::AuthMethodId("chatgpt".into()),
                 name: "ChatGPT".into(),
                 description: Some("Sign in with ChatGPT to use your plan".into()),
                 meta: None,
             },
-            AuthMethod {
-                id: AuthMethodId("apikey".into()),
+            acp::AuthMethod {
+                id: acp::AuthMethodId("apikey".into()),
                 name: "OpenAI API Key".into(),
                 description: Some("Use OPENAI_API_KEY from environment or auth.json".into()),
                 meta: None,
             },
         ];
         self.client_capabilities.replace(args.client_capabilities);
-        let capacities = AgentCapabilities {
+        let capacities = acp::AgentCapabilities {
             load_session: true,
-            prompt_capabilities: PromptCapabilities {
+            prompt_capabilities: acp::PromptCapabilities {
                 image: true,
                 audio: false,
                 embedded_context: true,
                 meta: None,
             },
-            mcp_capabilities: McpCapabilities {
+            mcp_capabilities: acp::McpCapabilities {
                 http: true,
                 sse: true,
                 meta: None,
             },
             meta: None,
         };
-        Ok(InitializeResponse {
+        Ok(acp::InitializeResponse {
             protocol_version: V1,
             agent_capabilities: capacities,
             auth_methods,
@@ -171,22 +162,13 @@ impl Agent for CodexAgent {
         })
     }
 
-    async fn authenticate(&self, args: AuthenticateRequest) -> Result<AuthenticateResponse, Error> {
+    async fn authenticate(
+        &self,
+        args: acp::AuthenticateRequest,
+    ) -> Result<acp::AuthenticateResponse, Error> {
         info!(?args, "Received authenticate request");
         let method = args.method_id.0.as_ref();
         match method {
-            "chatgpt" => {
-                // For ChatGPT, rely on existing auth.json or instruct the user to run codex login.
-                // Attempt to reload; if still unauthenticated, return an error.
-                if let Ok(am) = self.auth_manager.read() {
-                    am.reload();
-                    if am.auth().is_some() {
-                        return Ok(Default::default());
-                    }
-                }
-                Err(Error::auth_required()
-                    .with_data("Not signed in. Please run 'codex login' to sign in with ChatGPT."))
-            }
             "apikey" => {
                 // Use OPENAI_API_KEY if present; then reload.
                 // let key = std::env::var("OPENAI_API_KEY").ok();
@@ -209,7 +191,10 @@ impl Agent for CodexAgent {
         }
     }
 
-    async fn new_session(&self, args: NewSessionRequest) -> Result<NewSessionResponse, Error> {
+    async fn new_session(
+        &self,
+        args: acp::NewSessionRequest,
+    ) -> Result<acp::NewSessionResponse, Error> {
         info!(?args, "Received new session request");
         // Start a new Codex conversation for this session
         let (conversation_id, conversation_opt, session_configured) = match self
@@ -228,10 +213,10 @@ impl Agent for CodexAgent {
             }
         };
 
-        let session_id = session_configured.session_id;
+        let session_id = session_configured.session_id.to_string();
         // Track the session
         self.sessions.borrow_mut().insert(
-            session_id.to_string(),
+            session_id.clone(),
             SessionState {
                 created: SystemTime::now(),
                 conversation_id: conversation_id.to_string(),
@@ -244,9 +229,9 @@ impl Agent for CodexAgent {
 
         let (tx, rx) = oneshot::channel();
         let _ = self.session_update_tx.send((
-            SessionNotification {
-                session_id: SessionId(session_id.clone().to_string().into()),
-                update: SessionUpdate::AvailableCommandsUpdate {
+            acp::SessionNotification {
+                session_id: acp::SessionId(session_id.clone().into()),
+                update: acp::SessionUpdate::AvailableCommandsUpdate {
                     available_commands: self.available_commands.clone(),
                 },
                 meta: None,
@@ -255,25 +240,25 @@ impl Agent for CodexAgent {
         ));
         let _ = rx.await;
 
-        Ok(NewSessionResponse {
-            session_id: SessionId(session_configured.session_id.to_string().into()),
-            modes: Some(SessionModeState {
-                current_mode_id: SessionModeId("auto".into()),
+        Ok(acp::NewSessionResponse {
+            session_id: acp::SessionId(session_configured.session_id.to_string().into()),
+            modes: Some(acp::SessionModeState {
+                current_mode_id: acp::SessionModeId("auto".into()),
                 available_modes: vec![
-                    SessionMode {
-                        id: SessionModeId("read-only".into()),
+                    acp::SessionMode {
+                        id: acp::SessionModeId("read-only".into()),
                         name: "Read Only".to_string(),
                         description: Some("Codex can read files and answer questions. Codex requires approval to make edits, run commands, or access network".to_string()),
                         meta: None,
                     },
-                    SessionMode {
-                        id: SessionModeId("auto".into()),
+                    acp::SessionMode {
+                        id: acp::SessionModeId("auto".into()),
                         name: "Auto".to_string(),
                         description: Some("Codex can read files, make edits, and run commands in the workspace. Codex requires approval to work outside the workspace or access network".to_string()),
                         meta: None,
                     },
-                    SessionMode {
-                        id: SessionModeId("full-access".into()),
+                    acp::SessionMode {
+                        id: acp::SessionModeId("full-access".into()),
                         name: "Full Access".to_string(),
                         description: Some("Codex can read files, make edits, and run commands with network access, without approval. Exercise caution".to_string()),
                         meta: None,
@@ -285,9 +270,12 @@ impl Agent for CodexAgent {
         })
     }
 
-    async fn load_session(&self, args: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
+    async fn load_session(
+        &self,
+        args: acp::LoadSessionRequest,
+    ) -> Result<acp::LoadSessionResponse, Error> {
         info!(?args, "Received load session request");
-        Ok(LoadSessionResponse {
+        Ok(acp::LoadSessionResponse {
             modes: None,
             meta: None,
         })
@@ -295,12 +283,12 @@ impl Agent for CodexAgent {
 
     async fn set_session_mode(
         &self,
-        args: SetSessionModeRequest,
-    ) -> Result<SetSessionModeResponse, Error> {
+        args: acp::SetSessionModeRequest,
+    ) -> Result<acp::SetSessionModeResponse, Error> {
         info!(?args, "Received set session mode request");
         // Validate session exists
-        let sid_str = args.session_id.0.to_string();
-        if !self.sessions.borrow().contains_key(&sid_str) {
+        let session_id = args.session_id.0.to_string();
+        if !self.sessions.borrow().contains_key(&session_id) {
             return Err(Error::invalid_params());
         }
 
@@ -308,9 +296,9 @@ impl Agent for CodexAgent {
         let (tx, rx) = oneshot::channel();
         self.session_update_tx
             .send((
-                SessionNotification {
+                acp::SessionNotification {
                     session_id: args.session_id.clone(),
-                    update: SessionUpdate::CurrentModeUpdate {
+                    update: acp::SessionUpdate::CurrentModeUpdate {
                         current_mode_id: args.mode_id,
                     },
                     meta: None,
@@ -319,11 +307,10 @@ impl Agent for CodexAgent {
             ))
             .map_err(Error::into_internal_error)?;
         let _ = rx.await;
-
-        Ok(SetSessionModeResponse { meta: None })
+        Ok(acp::SetSessionModeResponse { meta: None })
     }
 
-    async fn prompt(&self, args: PromptRequest) -> Result<PromptResponse, Error> {
+    async fn prompt(&self, args: acp::PromptRequest) -> Result<acp::PromptResponse, Error> {
         info!(?args, "Received prompt request");
         let session_id = args.session_id.0.to_string();
         let session = match self.sessions.borrow().get(&session_id) {
@@ -332,7 +319,7 @@ impl Agent for CodexAgent {
         };
 
         // Handle slash commands (e.g., "/status") when the first block is text starting with '/'
-        if let Some(ContentBlock::Text(t)) = args.prompt.first() {
+        if let Some(acp::ContentBlock::Text(t)) = args.prompt.first() {
             let line = t.text.trim();
             if let Some(cmd) = line.strip_prefix('/') {
                 let mut parts = cmd.split_whitespace();
@@ -342,8 +329,8 @@ impl Agent for CodexAgent {
                     .handle_slash_command(&args.session_id, &name, &rest)
                     .await?
                 {
-                    return Ok(PromptResponse {
-                        stop_reason: StopReason::EndTurn,
+                    return Ok(acp::PromptResponse {
+                        stop_reason: acp::StopReason::EndTurn,
                         meta: None,
                     });
                 }
@@ -356,8 +343,8 @@ impl Agent for CodexAgent {
             let (tx, rx) = oneshot::channel();
             self.send_message_chunk(&args.session_id, msg.into(), tx)?;
             let _ = rx.await;
-            return Ok(PromptResponse {
-                stop_reason: StopReason::EndTurn,
+            return Ok(acp::PromptResponse {
+                stop_reason: acp::StopReason::EndTurn,
                 meta: None,
             });
         }
@@ -366,26 +353,27 @@ impl Agent for CodexAgent {
         let mut items: Vec<InputItem> = Vec::new();
         for block in &args.prompt {
             match block {
-                ContentBlock::Text(t) => {
+                acp::ContentBlock::Text(t) => {
                     items.push(InputItem::Text {
                         text: t.text.clone(),
                     });
                 }
-                ContentBlock::Image(img) => {
+                acp::ContentBlock::Image(img) => {
                     let url = format!("data:{};base64,{}", img.mime_type, img.data);
                     items.push(InputItem::Image { image_url: url });
                 }
-                ContentBlock::Audio(_a) => {
+                acp::ContentBlock::Audio(_a) => {
                     // Not supported by Codex input yet; skip.
                 }
-                ContentBlock::Resource(res) => {
-                    if let EmbeddedResourceResource::TextResourceContents(trc) = &res.resource {
+                acp::ContentBlock::Resource(res) => {
+                    if let acp::EmbeddedResourceResource::TextResourceContents(trc) = &res.resource
+                    {
                         items.push(InputItem::Text {
                             text: trc.text.clone(),
                         });
                     }
                 }
-                ContentBlock::ResourceLink(link) => {
+                acp::ContentBlock::ResourceLink(link) => {
                     items.push(InputItem::Text {
                         text: format!("Resource: {}", link.uri),
                     });
@@ -401,22 +389,22 @@ impl Agent for CodexAgent {
             .map_err(Error::into_internal_error)?;
 
         let pos = Arc::new(vec![
-            PermissionOption {
-                id: PermissionOptionId("approve_for_session".into()),
+            acp::PermissionOption {
+                id: acp::PermissionOptionId("approve_for_session".into()),
                 name: "Approve for Session".into(),
-                kind: PermissionOptionKind::AllowAlways,
+                kind: acp::PermissionOptionKind::AllowAlways,
                 meta: None,
             },
-            PermissionOption {
-                id: PermissionOptionId("approve".into()),
+            acp::PermissionOption {
+                id: acp::PermissionOptionId("approve".into()),
                 name: "Approve".into(),
-                kind: PermissionOptionKind::AllowOnce,
+                kind: acp::PermissionOptionKind::AllowOnce,
                 meta: None,
             },
-            PermissionOption {
-                id: PermissionOptionId("deny".into()),
+            acp::PermissionOption {
+                id: acp::PermissionOptionId("deny".into()),
                 name: "Deny".into(),
-                kind: PermissionOptionKind::RejectOnce,
+                kind: acp::PermissionOptionKind::RejectOnce,
                 meta: None,
             },
         ]);
@@ -466,11 +454,11 @@ impl Agent for CodexAgent {
                 // MCP tool calls → ACP ToolCall/ToolCallUpdate
                 EventMsg::McpToolCallBegin(begin) => {
                     let title = format!("{}.{}", begin.invocation.server, begin.invocation.tool);
-                    let tool = ToolCall {
-                        id: ToolCallId(begin.call_id.clone().into()),
+                    let tool = acp::ToolCall {
+                        id: acp::ToolCallId(begin.call_id.clone().into()),
                         title,
-                        kind: ToolKind::Fetch,
-                        status: ToolCallStatus::InProgress,
+                        kind: acp::ToolKind::Fetch,
+                        status: acp::ToolCallStatus::InProgress,
                         content: Vec::new(),
                         locations: Vec::new(),
                         raw_input: begin.invocation.arguments,
@@ -480,9 +468,9 @@ impl Agent for CodexAgent {
                     let (tx, rx) = oneshot::channel();
                     self.session_update_tx
                         .send((
-                            SessionNotification {
+                            acp::SessionNotification {
                                 session_id: args.session_id.clone(),
-                                update: SessionUpdate::ToolCall(tool),
+                                update: acp::SessionUpdate::ToolCall(tool),
                                 meta: None,
                             },
                             tx,
@@ -493,14 +481,14 @@ impl Agent for CodexAgent {
                 EventMsg::McpToolCallEnd(end) => {
                     // status and optional output
                     let status = if end.is_success() {
-                        ToolCallStatus::Completed
+                        acp::ToolCallStatus::Completed
                     } else {
-                        ToolCallStatus::Failed
+                        acp::ToolCallStatus::Failed
                     };
                     let raw_output = serde_json::to_value(&end.result).ok();
-                    let update = ToolCallUpdate {
-                        id: ToolCallId(end.call_id.clone().into()),
-                        fields: ToolCallUpdateFields {
+                    let update = acp::ToolCallUpdate {
+                        id: acp::ToolCallId(end.call_id.clone().into()),
+                        fields: acp::ToolCallUpdateFields {
                             status: Some(status),
                             title: Some(format!(
                                 "{}.{}",
@@ -514,9 +502,9 @@ impl Agent for CodexAgent {
                     let (tx, rx) = oneshot::channel();
                     self.session_update_tx
                         .send((
-                            SessionNotification {
+                            acp::SessionNotification {
                                 session_id: args.session_id.clone(),
-                                update: SessionUpdate::ToolCallUpdate(update),
+                                update: acp::SessionUpdate::ToolCallUpdate(update),
                                 meta: None,
                             },
                             tx,
@@ -527,16 +515,16 @@ impl Agent for CodexAgent {
                 // Exec command begin/end → ACP ToolCall/ToolCallUpdate
                 EventMsg::ExecCommandBegin(beg) => {
                     let title = beg.command.join(" ");
-                    let loc = ToolCallLocation {
+                    let loc = acp::ToolCallLocation {
                         path: beg.cwd.clone(),
                         line: None,
                         meta: None,
                     };
-                    let tool = ToolCall {
-                        id: ToolCallId(beg.call_id.clone().into()),
+                    let tool = acp::ToolCall {
+                        id: acp::ToolCallId(beg.call_id.clone().into()),
                         title,
-                        kind: ToolKind::Execute,
-                        status: ToolCallStatus::InProgress,
+                        kind: acp::ToolKind::Execute,
+                        status: acp::ToolCallStatus::InProgress,
                         content: Vec::new(),
                         locations: vec![loc],
                         raw_input: Some(json!({"command": beg.command, "cwd": beg.cwd})),
@@ -546,9 +534,9 @@ impl Agent for CodexAgent {
                     let (tx, rx) = oneshot::channel();
                     self.session_update_tx
                         .send((
-                            SessionNotification {
+                            acp::SessionNotification {
                                 session_id: args.session_id.clone(),
-                                update: SessionUpdate::ToolCall(tool),
+                                update: acp::SessionUpdate::ToolCall(tool),
                                 meta: None,
                             },
                             tx,
@@ -558,14 +546,14 @@ impl Agent for CodexAgent {
                 }
                 EventMsg::ExecCommandEnd(end) => {
                     let status = if end.exit_code == 0 {
-                        ToolCallStatus::Completed
+                        acp::ToolCallStatus::Completed
                     } else {
-                        ToolCallStatus::Failed
+                        acp::ToolCallStatus::Failed
                     };
 
-                    let mut content: Vec<ToolCallContent> = Vec::new();
+                    let mut content: Vec<acp::ToolCallContent> = Vec::new();
                     if !end.aggregated_output.is_empty() {
-                        content.push(ToolCallContent::from(end.aggregated_output.clone()));
+                        content.push(acp::ToolCallContent::from(end.aggregated_output.clone()));
                     } else if !end.stdout.is_empty() || !end.stderr.is_empty() {
                         let merged = if !end.stderr.is_empty() {
                             format!("{}\n{}", end.stdout, end.stderr)
@@ -573,13 +561,13 @@ impl Agent for CodexAgent {
                             end.stdout.clone()
                         };
                         if !merged.is_empty() {
-                            content.push(ToolCallContent::from(merged));
+                            content.push(acp::ToolCallContent::from(merged));
                         }
                     }
 
-                    let update = ToolCallUpdate {
-                        id: ToolCallId(end.call_id.clone().into()),
-                        fields: ToolCallUpdateFields {
+                    let update = acp::ToolCallUpdate {
+                        id: acp::ToolCallId(end.call_id.clone().into()),
+                        fields: acp::ToolCallUpdateFields {
                             status: Some(status),
                             content: if content.is_empty() {
                                 None
@@ -598,9 +586,9 @@ impl Agent for CodexAgent {
                     let (tx, rx) = oneshot::channel();
                     self.session_update_tx
                         .send((
-                            SessionNotification {
+                            acp::SessionNotification {
                                 session_id: args.session_id.clone(),
-                                update: SessionUpdate::ToolCallUpdate(update),
+                                update: acp::SessionUpdate::ToolCallUpdate(update),
                                 meta: None,
                             },
                             tx,
@@ -611,13 +599,13 @@ impl Agent for CodexAgent {
                 EventMsg::ExecApprovalRequest(req) => {
                     // Build a ToolCallUpdate describing the pending exec
                     let title = format!("`{}`", req.command.join(" "));
-                    let update = ToolCallUpdate {
-                        id: ToolCallId(req.call_id.clone().into()),
-                        fields: ToolCallUpdateFields {
-                            kind: Some(ToolKind::Execute),
-                            status: Some(ToolCallStatus::Pending),
+                    let update = acp::ToolCallUpdate {
+                        id: acp::ToolCallId(req.call_id.clone().into()),
+                        fields: acp::ToolCallUpdateFields {
+                            kind: Some(acp::ToolKind::Execute),
+                            status: Some(acp::ToolCallStatus::Pending),
                             title: Some(title),
-                            locations: Some(vec![ToolCallLocation {
+                            locations: Some(vec![acp::ToolCallLocation {
                                 path: req.cwd.clone(),
                                 line: None,
                                 meta: None,
@@ -627,7 +615,7 @@ impl Agent for CodexAgent {
                         meta: None,
                     };
 
-                    let permission_req = RequestPermissionRequest {
+                    let permission_req = acp::RequestPermissionRequest {
                         session_id: args.session_id.clone(),
                         tool_call: update,
                         options: pos.as_ref().clone(),
@@ -671,23 +659,23 @@ impl Agent for CodexAgent {
                     } else {
                         format!("Edit {} files", req.changes.len())
                     };
-                    let update = ToolCallUpdate {
-                        id: ToolCallId(req.call_id.clone().into()),
-                        fields: ToolCallUpdateFields {
-                            kind: Some(ToolKind::Edit),
-                            status: Some(ToolCallStatus::Pending),
+                    let update = acp::ToolCallUpdate {
+                        id: acp::ToolCallId(req.call_id.clone().into()),
+                        fields: acp::ToolCallUpdateFields {
+                            kind: Some(acp::ToolKind::Edit),
+                            status: Some(acp::ToolCallStatus::Pending),
                             title: Some(title),
                             content: if lines.is_empty() {
                                 None
                             } else {
-                                Some(vec![ToolCallContent::from(lines.join("\n"))])
+                                Some(vec![acp::ToolCallContent::from(lines.join("\n"))])
                             },
                             ..Default::default()
                         },
                         meta: None,
                     };
 
-                    let reqp = RequestPermissionRequest {
+                    let reqp = acp::RequestPermissionRequest {
                         session_id: args.session_id.clone(),
                         tool_call: update,
                         options: pos.as_ref().clone(),
@@ -729,38 +717,46 @@ impl Agent for CodexAgent {
             }
         }
 
-        Ok(PromptResponse {
-            stop_reason: StopReason::EndTurn,
+        Ok(acp::PromptResponse {
+            stop_reason: acp::StopReason::EndTurn,
             meta: None,
         })
     }
 
-    async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
+    async fn cancel(&self, args: acp::CancelNotification) -> Result<(), Error> {
         info!(?args, "Received cancel request");
         let session_id = args.session_id.0.to_string();
-        // If we have an active Codex conversation, forward an interrupt.
-        // Avoid holding a RefCell borrow across await by scoping the borrow.
+        // Scope borrow to avoid RefCell issues across await
         let conv_opt = {
             let sessions = self.sessions.borrow();
             sessions
                 .get(&session_id)
                 .and_then(|s| s.conversation.clone())
         };
-        if let Some(conv) = conv_opt {
-            // Best-effort: we don't need the submission id here.
-            let _ = conv.submit(Op::Interrupt).await;
-        } else {
-            return Err(Error::invalid_params());
+        match conv_opt {
+            Some(conv) => {
+                // Best-effort: we don't need the submission id here.
+                let _ = conv.submit(Op::Interrupt).await;
+                // Remove session from cache after interrupt
+                self.sessions.borrow_mut().remove(&session_id);
+                Ok(())
+            }
+            None => {
+                warn!(
+                    session_id,
+                    "Cancel called but no active Codex conversation found"
+                );
+                Err(Error::invalid_params().with_data("No active Codex backend for cancel"))
+            }
         }
-        Ok(())
     }
 
-    async fn ext_method(&self, args: ExtRequest) -> Result<ExtResponse, Error> {
+    async fn ext_method(&self, args: acp::ExtRequest) -> Result<acp::ExtResponse, Error> {
         info!(method = %args.method, params = ?args.params, "Received extension method call");
         Ok(serde_json::value::to_raw_value(&json!({"example": "response"}))?.into())
     }
 
-    async fn ext_notification(&self, args: ExtNotification) -> Result<(), Error> {
+    async fn ext_notification(&self, args: acp::ExtNotification) -> Result<(), Error> {
         info!(method = %args.method, params = ?args.params, "Received extension notification call");
         Ok(())
     }
