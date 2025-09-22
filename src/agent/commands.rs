@@ -397,35 +397,47 @@ Notes for Agents
                 u.output_tokens.to_string(),
                 u.total_tokens.to_string(),
             ),
-            None => (
-                "(unknown)".to_string(),
-                "(unknown)".to_string(),
-                "(unknown)".to_string(),
-            ),
+            None => ("0".to_string(), "0".to_string(), "0".to_string()),
         };
 
         let status = format!(
-            r#"📂 Workspace
+            r#"
+📂 Workspace
+
     Path:           {cwd}
+
     Approval Mode:  {approval}
+
     Sandbox:        {sandbox}
+
     AGENTS files:   {agents}
 
 👤 Account
+
     Signed in with: {auth_mode}
+
     Login:          {email}
+
     Plan:           {plan}
 
 🧠 Model
+
     Name:               {model}
+
     Provider:           {provider}
+
     Reasoning Effort:   {effort}
+
     Reasoning Summaries:{summary}
 
 📊 Token Usage
+
     Session ID:     {sid}
+
     Input:          {input}
+
     Output:         {output}
+
     Total:          {total}
 "#,
             cwd = cwd,
