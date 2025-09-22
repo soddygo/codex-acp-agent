@@ -35,12 +35,6 @@ The agent communicates over stdin/stdout using ACP JSON-RPC. Launch it and conne
 RUST_LOG=info cargo run --quiet
 ```
 
-To run without a Codex backend (slash-commands only), enable mock mode:
-
-```bash
-ACP_DEV_ALLOW_MOCK=1 RUST_LOG=info cargo run --quiet
-```
-
 Because this agent speaks on stdio, it is intended to be spawned by your client. For manual testing, you can pipe ACP JSON-RPC messages to stdin and read replies from stdout.
 
 Example JSON-RPC (initialize → new session → /status):
@@ -138,11 +132,6 @@ The `/status` command prints a human-friendly summary, e.g.:
 Notes
 - Some fields may be unknown depending on your auth mode and environment.
 - Token counts are aggregated from Codex `EventMsg::TokenCount` when available.
-
-## Authentication
-
-- Use `codex login` (ChatGPT) or set `OPENAI_API_KEY` for API-key mode.
-- The agent currently implements `authenticate` for the API key method; ChatGPT sign-in is surfaced via initialization metadata and handled by Codex core.
 
 ## Development
 

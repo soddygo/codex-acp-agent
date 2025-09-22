@@ -6,14 +6,15 @@ use std::time::SystemTime;
 
 use agent_client_protocol::{self as acp, Agent, Error, V1};
 use codex_core::{
-    config::Config as CodexConfig, protocol::{
+    AuthManager, CodexConversation, ConversationManager, NewConversation,
+    config::Config as CodexConfig,
+    protocol::{
         AskForApproval, EventMsg, InputItem, Op, ReviewDecision, SandboxPolicy, TokenUsage,
-    }, AuthManager, CodexConversation,
-    ConversationManager,
-    NewConversation,
+    },
 };
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot, oneshot::Sender};
+use tokio::task;
 use tracing::{info, warn};
 
 mod commands;
@@ -227,18 +228,25 @@ impl Agent for CodexAgent {
             },
         );
 
-        let (tx, rx) = oneshot::channel();
-        let _ = self.session_update_tx.send((
-            acp::SessionNotification {
-                session_id: acp::SessionId(session_id.clone().into()),
-                update: acp::SessionUpdate::AvailableCommandsUpdate {
-                    available_commands: self.available_commands.clone(),
-                },
-                meta: None,
-            },
-            tx,
-        ));
-        let _ = rx.await;
+        // Advertise available slash commands to the client right after
+        // the session is created. Send it asynchronously to avoid racing
+        // with the NewSessionResponse delivery.
+        {
+            let available_commands = self.available_commands.clone();
+            let tx_updates = self.session_update_tx.clone();
+            task::spawn_local(async move {
+                let (tx, rx) = oneshot::channel();
+                let _ = tx_updates.send((
+                    acp::SessionNotification {
+                        session_id: acp::SessionId(session_id.clone().into()),
+                        update: acp::SessionUpdate::AvailableCommandsUpdate { available_commands },
+                        meta: None,
+                    },
+                    tx,
+                ));
+                let _ = rx.await;
+            });
+        }
 
         Ok(acp::NewSessionResponse {
             session_id: acp::SessionId(session_configured.session_id.to_string().into()),
@@ -315,7 +323,7 @@ impl Agent for CodexAgent {
         let session_id = args.session_id.0.to_string();
         let session = match self.sessions.borrow().get(&session_id) {
             Some(s) => s.clone(),
-            None => return Err(Error::invalid_params()),
+            None => return Err(Error::invalid_params().with_data("Session not found")),
         };
 
         // Handle slash commands (e.g., "/status") when the first block is text starting with '/'
@@ -338,16 +346,19 @@ impl Agent for CodexAgent {
         }
 
         // Ensure we have a Codex conversation for non-slash content.
-        if session.conversation.as_ref().is_none() {
-            let msg = "No Codex backend available. Use slash commands like /status";
-            let (tx, rx) = oneshot::channel();
-            self.send_message_chunk(&args.session_id, msg.into(), tx)?;
-            let _ = rx.await;
-            return Ok(acp::PromptResponse {
-                stop_reason: acp::StopReason::EndTurn,
-                meta: None,
-            });
-        }
+        let conversation = match session.conversation.as_ref() {
+            Some(conv) => conv.clone(),
+            None => {
+                let msg = "No Codex backend available. Use slash commands like /status";
+                let (tx, rx) = oneshot::channel();
+                self.send_message_chunk(&args.session_id, msg.into(), tx)?;
+                let _ = rx.await;
+                return Ok(acp::PromptResponse {
+                    stop_reason: acp::StopReason::EndTurn,
+                    meta: None,
+                });
+            }
+        };
 
         // Build user input submission items from prompt content blocks.
         let mut items: Vec<InputItem> = Vec::new();
@@ -381,7 +392,6 @@ impl Agent for CodexAgent {
             }
         }
 
-        let conversation = session.conversation.clone().unwrap();
         // Enqueue work and then stream corresponding events back as ACP updates.
         let submit_id = conversation
             .submit(Op::UserInput { items })
@@ -411,8 +421,7 @@ impl Agent for CodexAgent {
 
         let mut saw_message_delta = false;
         let mut saw_reasoning_delta = false;
-
-        loop {
+        let stop_reason = loop {
             let event = conversation
                 .next_event()
                 .await
@@ -514,19 +523,17 @@ impl Agent for CodexAgent {
                 }
                 // Exec command begin/end → ACP ToolCall/ToolCallUpdate
                 EventMsg::ExecCommandBegin(beg) => {
-                    let title = beg.command.join(" ");
-                    let loc = acp::ToolCallLocation {
-                        path: beg.cwd.clone(),
-                        line: None,
-                        meta: None,
-                    };
                     let tool = acp::ToolCall {
                         id: acp::ToolCallId(beg.call_id.clone().into()),
-                        title,
+                        title: beg.command.join(" "),
                         kind: acp::ToolKind::Execute,
                         status: acp::ToolCallStatus::InProgress,
                         content: Vec::new(),
-                        locations: vec![loc],
+                        locations: vec![acp::ToolCallLocation {
+                            path: beg.cwd.clone(),
+                            line: None,
+                            meta: None,
+                        }],
                         raw_input: Some(json!({"command": beg.command, "cwd": beg.cwd})),
                         raw_output: None,
                         meta: None,
@@ -641,21 +648,39 @@ impl Agent for CodexAgent {
                 }
                 EventMsg::ApplyPatchApprovalRequest(req) => {
                     // Summarize patch as content lines
-                    let mut lines = Vec::new();
+                    let mut contents = Vec::new();
                     for (path, change) in req.changes.iter() {
                         use codex_core::protocol::FileChange as FC;
-                        let s = match change {
-                            FC::Add { .. } => format!("Add {}", path.display()),
-                            FC::Delete { .. } => format!("Delete {}", path.display()),
-                            FC::Update { .. } => format!("Update {}", path.display()),
+                        match change {
+                            FC::Add { content } => {
+                                contents.push(acp::ToolCallContent::from(acp::Diff {
+                                    path: path.clone(),
+                                    old_text: Some("".into()),
+                                    new_text: content.clone(),
+                                    meta: None,
+                                }));
+                            }
+                            FC::Delete { content } => {
+                                contents.push(acp::ToolCallContent::from(acp::Diff {
+                                    path: path.clone(),
+                                    old_text: Some(content.clone()),
+                                    new_text: "".into(),
+                                    meta: None,
+                                }));
+                            }
+                            FC::Update { unified_diff, .. } => {
+                                contents.push(acp::ToolCallContent::from(acp::Diff {
+                                    path: path.clone(),
+                                    old_text: Some(unified_diff.into()),
+                                    new_text: unified_diff.clone(),
+                                    meta: None,
+                                }));
+                            }
                         };
-                        lines.push(s);
                     }
+
                     let title = if req.changes.len() == 1 {
-                        lines
-                            .first()
-                            .cloned()
-                            .unwrap_or_else(|| "Apply changes".into())
+                        "Apply changes".to_string()
                     } else {
                         format!("Edit {} files", req.changes.len())
                     };
@@ -665,26 +690,27 @@ impl Agent for CodexAgent {
                             kind: Some(acp::ToolKind::Edit),
                             status: Some(acp::ToolCallStatus::Pending),
                             title: Some(title),
-                            content: if lines.is_empty() {
+                            content: if contents.is_empty() {
                                 None
                             } else {
-                                Some(vec![acp::ToolCallContent::from(lines.join("\n"))])
+                                Some(contents)
                             },
                             ..Default::default()
                         },
                         meta: None,
                     };
 
-                    let reqp = acp::RequestPermissionRequest {
+                    let permission_req = acp::RequestPermissionRequest {
                         session_id: args.session_id.clone(),
                         tool_call: update,
                         options: pos.as_ref().clone(),
                         meta: None,
                     };
                     let (txp, rxp) = oneshot::channel();
-                    let _ = self.client_tx.send(ClientOp::RequestPermission(reqp, txp));
-                    let outcome = rxp.await.map_err(|_| Error::internal_error())?;
-                    if let Ok(resp) = outcome {
+                    let _ = self
+                        .client_tx
+                        .send(ClientOp::RequestPermission(permission_req, txp));
+                    if let Ok(resp) = rxp.await.map_err(Error::into_internal_error)? {
                         let decision = self.handle_response_outcome(resp);
                         conversation
                             .submit(Op::PatchApproval {
@@ -704,21 +730,27 @@ impl Agent for CodexAgent {
                     }
                 }
                 EventMsg::TaskComplete(_) => {
-                    break;
+                    break acp::StopReason::EndTurn;
                 }
                 EventMsg::Error(err) => {
                     let (tx, rx) = oneshot::channel();
                     self.send_message_chunk(&args.session_id, err.message.into(), tx)?;
                     let _ = rx.await;
-                    break;
+                    break acp::StopReason::EndTurn;
+                }
+                EventMsg::TurnAborted(_) => {
+                    let (tx, rx) = oneshot::channel();
+                    self.send_message_chunk(&args.session_id, "".into(), tx)?;
+                    let _ = rx.await;
+                    break acp::StopReason::Cancelled;
                 }
                 // Ignore other events for now.
                 _ => {}
             }
-        }
+        };
 
         Ok(acp::PromptResponse {
-            stop_reason: acp::StopReason::EndTurn,
+            stop_reason,
             meta: None,
         })
     }
