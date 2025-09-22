@@ -10,8 +10,8 @@ readme = "README.md"
 agent-client-protocol = { version = "0.4" }
 anyhow = { version = "1.0" }
 async-trait = { version = "0.1" }
-codex-cli = { git = "https://github.com/openai/codex" }
-codex-core = { git = "https://github.com/openai/codex" }
+codex-cli = { git = "https://github.com/openai/codex", branch = "main" }
+codex-core = { git = "https://github.com/openai/codex", branch = "main" }
 tokio = { version = "1.47.1", features = [
   "macros",
   "rt",
