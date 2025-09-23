@@ -578,12 +578,12 @@ impl Agent for CodexAgent {
                         (None, Some(final_text)) => Some(final_text),
                         (None, None) => None,
                     };
-                    if let Some(text) = content {
-                        if !text.trim().is_empty() {
-                            let (tx, rx) = oneshot::channel();
-                            self.send_thought_chunk(&args.session_id, text.into(), tx)?;
-                            rx.await.map_err(Error::into_internal_error)?;
-                        }
+                    if let Some(text) = content
+                        && !text.trim().is_empty()
+                    {
+                        let (tx, rx) = oneshot::channel();
+                        self.send_thought_chunk(&args.session_id, text.into(), tx)?;
+                        rx.await.map_err(Error::into_internal_error)?;
                     }
                 }
                 EventMsg::AgentReasoningRawContent(reason) => {
@@ -884,12 +884,12 @@ impl Agent for CodexAgent {
             }
         };
 
-        if let Some(text) = self.take_reasoning_text(&args.session_id) {
-            if !text.trim().is_empty() {
-                let (tx, rx) = oneshot::channel();
-                self.send_thought_chunk(&args.session_id, text.into(), tx)?;
-                rx.await.map_err(Error::into_internal_error)?;
-            }
+        if let Some(text) = self.take_reasoning_text(&args.session_id)
+            && !text.trim().is_empty()
+        {
+            let (tx, rx) = oneshot::channel();
+            self.send_thought_chunk(&args.session_id, text.into(), tx)?;
+            rx.await.map_err(Error::into_internal_error)?;
         }
 
         Ok(acp::PromptResponse {
