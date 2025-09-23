@@ -324,11 +324,11 @@ impl Agent for CodexAgent {
             }
         };
 
-        if let Ok(mut sessions) = self.sessions.try_borrow_mut() {
-            if let Some(state) = sessions.get_mut(&session_id) {
-                state.conversation_id = session_configured.session_id.to_string();
-                state.conversation = Some(conversation.clone());
-            }
+        if let Ok(mut sessions) = self.sessions.try_borrow_mut()
+            && let Some(state) = sessions.get_mut(&session_id)
+        {
+            state.conversation_id = session_configured.session_id.to_string();
+            state.conversation = Some(conversation.clone());
         }
 
         // Advertise available slash commands to the client right after
@@ -404,10 +404,10 @@ impl Agent for CodexAgent {
             return Err(Error::invalid_params());
         }
 
-        // Notify client about the new current mode immediately.
-        let (tx, rx) = oneshot::channel();
-        self.session_update_tx
-            .send((
+        let tx_updates = self.session_update_tx.clone();
+        task::spawn_local(async move {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx_updates.send((
                 acp::SessionNotification {
                     session_id: args.session_id.clone(),
                     update: acp::SessionUpdate::CurrentModeUpdate {
@@ -416,9 +416,10 @@ impl Agent for CodexAgent {
                     meta: None,
                 },
                 tx,
-            ))
-            .map_err(Error::into_internal_error)?;
-        let _ = rx.await;
+            ));
+            let _ = rx.await;
+        });
+        // Notify client about the new current mode immediately.
         Ok(acp::SetSessionModeResponse { meta: None })
     }
 
