@@ -356,6 +356,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "codex-core",
+ "codex-protocol",
  "serde_json",
  "tokio",
  "tokio-util",
