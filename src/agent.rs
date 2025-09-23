@@ -538,10 +538,9 @@ impl Agent for CodexAgent {
 
             match event.msg {
                 EventMsg::AgentMessageDelta(delta) => {
-                    let chunk = Self::normalize_stream_chunk(delta.delta);
                     saw_message_delta = true;
                     let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(&args.session_id, chunk.into(), tx)?;
+                    self.send_message_chunk(&args.session_id, delta.delta.into(), tx)?;
                     rx.await.map_err(Error::into_internal_error)?;
                 }
                 EventMsg::AgentMessage(msg) => {
