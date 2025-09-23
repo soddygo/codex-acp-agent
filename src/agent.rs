@@ -31,6 +31,8 @@ struct SessionState {
     current_approval: AskForApproval,
     current_sandbox: SandboxPolicy,
     token_usage: Option<TokenUsage>,
+    reasoning_sections: Vec<String>,
+    current_reasoning_chunk: String,
 }
 
 pub struct CodexAgent {
@@ -86,6 +88,25 @@ impl CodexAgent {
         Ok(())
     }
 
+    pub fn send_thought_chunk(
+        &self,
+        session_id: &acp::SessionId,
+        content: acp::ContentBlock,
+        tx: Sender<()>,
+    ) -> Result<(), Error> {
+        self.session_update_tx
+            .send((
+                acp::SessionNotification {
+                    session_id: session_id.clone(),
+                    update: acp::SessionUpdate::AgentThoughtChunk { content },
+                    meta: None,
+                },
+                tx,
+            ))
+            .map_err(Error::into_internal_error)?;
+        Ok(())
+    }
+
     fn handle_response_outcome(&self, resp: acp::RequestPermissionResponse) -> ReviewDecision {
         match resp.outcome {
             acp::RequestPermissionOutcome::Selected { option_id } => {
@@ -101,14 +122,69 @@ impl CodexAgent {
         }
     }
 
-    fn normalize_stream_chunk(chunk: String) -> String {
-        if chunk.trim_end().ends_with("**") && !chunk.ends_with("**\n") {
-            let mut chunk = chunk;
-            chunk.push_str("\n\n");
-            chunk
-        } else {
-            chunk
-        }
+    fn with_session_state_mut<R, F>(&self, session_id: &acp::SessionId, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut SessionState) -> R,
+    {
+        let mut sessions = self.sessions.borrow_mut();
+        let key: &str = session_id.0.as_ref();
+        sessions.get_mut(key).map(f)
+    }
+
+    fn reset_reasoning_tracking(&self, session_id: &acp::SessionId) {
+        self.with_session_state_mut(session_id, |state| {
+            state.reasoning_sections.clear();
+            state.current_reasoning_chunk.clear();
+        });
+    }
+
+    fn append_reasoning_delta(&self, session_id: &acp::SessionId, delta: &str) {
+        self.with_session_state_mut(session_id, |state| {
+            state.current_reasoning_chunk.push_str(delta);
+        });
+    }
+
+    fn finish_current_reasoning_section(&self, session_id: &acp::SessionId) {
+        self.with_session_state_mut(session_id, |state| {
+            if !state.current_reasoning_chunk.is_empty() {
+                let chunk = std::mem::take(&mut state.current_reasoning_chunk);
+                state.reasoning_sections.push(chunk);
+            }
+        });
+    }
+
+    fn take_reasoning_text(&self, session_id: &acp::SessionId) -> Option<String> {
+        self.with_session_state_mut(session_id, |state| {
+            let mut combined = String::new();
+            let mut first = true;
+
+            for section in state.reasoning_sections.drain(..) {
+                if section.trim().is_empty() {
+                    continue;
+                }
+                if !first {
+                    combined.push_str("\n\n");
+                }
+                combined.push_str(section.trim_end());
+                first = false;
+            }
+
+            if !state.current_reasoning_chunk.trim().is_empty() {
+                if !first {
+                    combined.push_str("\n\n");
+                }
+                combined.push_str(state.current_reasoning_chunk.trim_end());
+            }
+
+            state.current_reasoning_chunk.clear();
+
+            if combined.is_empty() {
+                None
+            } else {
+                Some(combined)
+            }
+        })
+        .flatten()
     }
 }
 
@@ -225,6 +301,8 @@ impl Agent for CodexAgent {
                 current_approval: AskForApproval::OnRequest,
                 current_sandbox: SandboxPolicy::new_workspace_write_policy(),
                 token_usage: None,
+                reasoning_sections: Vec::new(),
+                current_reasoning_chunk: String::new(),
             },
         );
 
@@ -387,6 +465,8 @@ impl Agent for CodexAgent {
             }
         };
 
+        self.reset_reasoning_tracking(&args.session_id);
+
         // Build user input submission items from prompt content blocks.
         let mut items: Vec<InputItem> = Vec::new();
         for block in &args.prompt {
@@ -447,7 +527,6 @@ impl Agent for CodexAgent {
         ]);
 
         let mut saw_message_delta = false;
-        let mut saw_reasoning_delta = false;
         let stop_reason = loop {
             let event = conversation
                 .next_event()
@@ -459,10 +538,9 @@ impl Agent for CodexAgent {
 
             match event.msg {
                 EventMsg::AgentMessageDelta(delta) => {
-                    let chunk = Self::normalize_stream_chunk(delta.delta);
                     saw_message_delta = true;
                     let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(&args.session_id, chunk.into(), tx)?;
+                    self.send_message_chunk(&args.session_id, delta.delta.into(), tx)?;
                     rx.await.map_err(Error::into_internal_error)?;
                 }
                 EventMsg::AgentMessage(msg) => {
@@ -474,18 +552,48 @@ impl Agent for CodexAgent {
                     rx.await.map_err(Error::into_internal_error)?;
                 }
                 EventMsg::AgentReasoningDelta(delta) => {
-                    saw_reasoning_delta = true;
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(&args.session_id, delta.delta.into(), tx)?;
-                    rx.await.map_err(Error::into_internal_error)?;
+                    self.append_reasoning_delta(&args.session_id, &delta.delta);
+                }
+                EventMsg::AgentReasoningRawContentDelta(delta) => {
+                    self.append_reasoning_delta(&args.session_id, &delta.delta);
                 }
                 EventMsg::AgentReasoning(reason) => {
-                    if saw_reasoning_delta {
-                        continue;
+                    self.finish_current_reasoning_section(&args.session_id);
+                    let aggregated = self.take_reasoning_text(&args.session_id);
+                    let normalized_final = if reason.text.trim().is_empty() {
+                        None
+                    } else {
+                        Some(reason.text)
+                    };
+
+                    let content = match (aggregated, normalized_final) {
+                        (Some(agg), Some(final_text)) => {
+                            if final_text.trim().len() > agg.trim().len() {
+                                Some(final_text)
+                            } else {
+                                Some(agg)
+                            }
+                        }
+                        (Some(agg), None) => Some(agg),
+                        (None, Some(final_text)) => Some(final_text),
+                        (None, None) => None,
+                    };
+                    if let Some(text) = content
+                        && !text.trim().is_empty()
+                    {
+                        let (tx, rx) = oneshot::channel();
+                        self.send_thought_chunk(&args.session_id, text.into(), tx)?;
+                        rx.await.map_err(Error::into_internal_error)?;
                     }
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(&args.session_id, reason.text.into(), tx)?;
-                    rx.await.map_err(Error::into_internal_error)?;
+                }
+                EventMsg::AgentReasoningRawContent(reason) => {
+                    self.finish_current_reasoning_section(&args.session_id);
+                    if !reason.text.trim().is_empty() {
+                        self.append_reasoning_delta(&args.session_id, &reason.text);
+                    }
+                }
+                EventMsg::AgentReasoningSectionBreak(_) => {
+                    self.finish_current_reasoning_section(&args.session_id);
                 }
                 // MCP tool calls → ACP ToolCall/ToolCallUpdate
                 EventMsg::McpToolCallBegin(begin) => {
@@ -775,6 +883,14 @@ impl Agent for CodexAgent {
                 _ => {}
             }
         };
+
+        if let Some(text) = self.take_reasoning_text(&args.session_id)
+            && !text.trim().is_empty()
+        {
+            let (tx, rx) = oneshot::channel();
+            self.send_thought_chunk(&args.session_id, text.into(), tx)?;
+            rx.await.map_err(Error::into_internal_error)?;
+        }
 
         Ok(acp::PromptResponse {
             stop_reason,
