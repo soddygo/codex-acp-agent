@@ -12,6 +12,7 @@ use codex_core::{
         AskForApproval, EventMsg, InputItem, Op, ReviewDecision, SandboxPolicy, TokenUsage,
     },
 };
+use codex_protocol::mcp_protocol::AuthMode;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot, oneshot::Sender};
 use tokio::task;
@@ -41,6 +42,7 @@ pub struct CodexAgent {
     available_commands: Vec<acp::AvailableCommand>,
     client_tx: mpsc::UnboundedSender<ClientOp>,
     client_capabilities: RefCell<acp::ClientCapabilities>,
+    next_session_id: RefCell<u64>,
 }
 
 impl CodexAgent {
@@ -61,6 +63,7 @@ impl CodexAgent {
             available_commands: commands::built_in_commands(),
             client_tx,
             client_capabilities: RefCell::new(Default::default()),
+            next_session_id: RefCell::new(1),
         }
     }
 
@@ -181,6 +184,18 @@ impl Agent for CodexAgent {
                 }
                 Err(Error::auth_required().with_data("Failed to load API key auth"))
             }
+            "chatgpt" => {
+                if let Ok(am) = self.auth_manager.write() {
+                    am.reload();
+                    if let Some(auth) = am.auth()
+                        && auth.mode == AuthMode::ChatGPT
+                    {
+                        return Ok(Default::default());
+                    }
+                }
+                Err(Error::auth_required()
+                    .with_data("ChatGPT login not found. Run `codex login` to connect your plan."))
+            }
             other => {
                 Err(Error::invalid_params().with_data(format!("unknown auth method: {}", other)))
             }
@@ -192,41 +207,57 @@ impl Agent for CodexAgent {
         args: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, Error> {
         info!(?args, "Received new session request");
-        // Start a new Codex conversation for this session
-        let (conversation_id, conversation_opt, session_configured) = match self
-            .conversation_manager
-            .new_conversation(self.config.clone())
-            .await
-        {
-            Ok(NewConversation {
-                conversation_id,
-                conversation,
-                session_configured,
-            }) => (conversation_id, Some(conversation), session_configured),
-            Err(e) => {
-                warn!(error = %e, "Failed to create Codex conversation");
-                return Err(Error::into_internal_error(e));
-            }
+        let session_id = {
+            let mut next_id = self.next_session_id.borrow_mut();
+            let session_id = next_id.to_string();
+            *next_id += 1;
+            session_id
         };
 
-        let session_id = session_configured.session_id.to_string();
-        // Track the session
+        // Populate a placeholder session entry prior to spawning Codex so that
+        // pipelined requests (like an immediate `/status`) see the session.
         self.sessions.borrow_mut().insert(
             session_id.clone(),
             SessionState {
                 created: SystemTime::now(),
-                conversation_id: conversation_id.to_string(),
-                conversation: conversation_opt,
+                conversation_id: String::new(),
+                conversation: None,
                 current_approval: AskForApproval::OnRequest,
                 current_sandbox: SandboxPolicy::new_workspace_write_policy(),
                 token_usage: None,
             },
         );
 
+        // Start a new Codex conversation for this session
+        let (conversation, session_configured) = match self
+            .conversation_manager
+            .new_conversation(self.config.clone())
+            .await
+        {
+            Ok(NewConversation {
+                conversation,
+                session_configured,
+                ..
+            }) => (conversation, session_configured),
+            Err(e) => {
+                warn!(error = %e, "Failed to create Codex conversation");
+                self.sessions.borrow_mut().remove(&session_id);
+                return Err(Error::into_internal_error(e));
+            }
+        };
+
+        if let Ok(mut sessions) = self.sessions.try_borrow_mut() {
+            if let Some(state) = sessions.get_mut(&session_id) {
+                state.conversation_id = session_configured.session_id.to_string();
+                state.conversation = Some(conversation.clone());
+            }
+        }
+
         // Advertise available slash commands to the client right after
         // the session is created. Send it asynchronously to avoid racing
         // with the NewSessionResponse delivery.
         {
+            let session_id = session_id.clone();
             let available_commands = self.available_commands.clone();
             let tx_updates = self.session_update_tx.clone();
             task::spawn_local(async move {
@@ -244,7 +275,7 @@ impl Agent for CodexAgent {
         }
 
         Ok(acp::NewSessionResponse {
-            session_id: acp::SessionId(session_configured.session_id.to_string().into()),
+            session_id: acp::SessionId(session_id.into()),
             modes: Some(acp::SessionModeState {
                 current_mode_id: acp::SessionModeId("auto".into()),
                 available_modes: vec![

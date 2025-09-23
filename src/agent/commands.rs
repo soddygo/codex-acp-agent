@@ -380,7 +380,7 @@ Notes for Agents
 
     async fn render_status(&self, sid_str: &str) -> String {
         // Session snapshot
-        let (approval_mode, sandbox_mode, token_usage, session_uuid) = {
+        let (approval_mode, sandbox_mode, token_usage, mut session_uuid) = {
             let map = self.sessions.borrow();
             if let Some(state) = map.get(sid_str) {
                 (
@@ -398,6 +398,10 @@ Notes for Agents
                 )
             }
         };
+
+        if session_uuid.is_empty() {
+            session_uuid = "(initializing)".to_string();
+        }
 
         // Workspace
         let cwd = self.shorten_home(&self.config.cwd);
