@@ -171,11 +171,6 @@ impl Agent for CodexAgent {
         let method = args.method_id.0.as_ref();
         match method {
             "apikey" => {
-                // Use OPENAI_API_KEY if present; then reload.
-                // let key = std::env::var("OPENAI_API_KEY").ok();
-                // if key.is_none() {
-                //     return Err(Error::auth_required().with_data("OPENAI_API_KEY not set"));
-                // }
                 if let Ok(am) = self.auth_manager.write() {
                     // Persisting the API key is handled by Codex core when reloading;
                     // here we simply reload and check.
