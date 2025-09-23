@@ -19,9 +19,9 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-client-protocol"
-version = "0.4.0"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc2526e80463b9742afed4829aedd6ae5632d6db778c6cc1fecb80c960c3521b"
+checksum = "00e33b9f4bd34d342b6f80b7156d3a37a04aeec16313f264001e52d6a9118600"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -366,7 +366,7 @@ dependencies = [
 [[package]]
 name = "codex-apply-patch"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#5996ee0e5f75e4f27afd76334db78a33a7fec997"
+source = "git+https://github.com/openai/codex?branch=main#c415827ac20b7af1155fa7aaabdd0da70d4779d7"
 dependencies = [
  "anyhow",
  "once_cell",
@@ -379,7 +379,7 @@ dependencies = [
 [[package]]
 name = "codex-core"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#5996ee0e5f75e4f27afd76334db78a33a7fec997"
+source = "git+https://github.com/openai/codex?branch=main#c415827ac20b7af1155fa7aaabdd0da70d4779d7"
 dependencies = [
  "anyhow",
  "askama",
@@ -429,7 +429,7 @@ dependencies = [
 [[package]]
 name = "codex-file-search"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#5996ee0e5f75e4f27afd76334db78a33a7fec997"
+source = "git+https://github.com/openai/codex?branch=main#c415827ac20b7af1155fa7aaabdd0da70d4779d7"
 dependencies = [
  "anyhow",
  "clap",
@@ -443,7 +443,7 @@ dependencies = [
 [[package]]
 name = "codex-mcp-client"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#5996ee0e5f75e4f27afd76334db78a33a7fec997"
+source = "git+https://github.com/openai/codex?branch=main#c415827ac20b7af1155fa7aaabdd0da70d4779d7"
 dependencies = [
  "anyhow",
  "mcp-types",
@@ -457,7 +457,7 @@ dependencies = [
 [[package]]
 name = "codex-protocol"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#5996ee0e5f75e4f27afd76334db78a33a7fec997"
+source = "git+https://github.com/openai/codex?branch=main#c415827ac20b7af1155fa7aaabdd0da70d4779d7"
 dependencies = [
  "base64",
  "icu_decimal",
@@ -1479,7 +1479,7 @@ dependencies = [
 [[package]]
 name = "mcp-types"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#5996ee0e5f75e4f27afd76334db78a33a7fec997"
+source = "git+https://github.com/openai/codex?branch=main#c415827ac20b7af1155fa7aaabdd0da70d4779d7"
 dependencies = [
  "serde",
  "serde_json",
@@ -2826,9 +2826,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter"
-version = "0.25.9"
+version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccd2a058a86cfece0bf96f7cce1021efef9c8ed0e892ab74639173e5ed7a34fa"
+checksum = "78f873475d258561b06f1c595d93308a7ed124d9977cb26b148c2084a4a3cc87"
 dependencies = [
  "cc",
  "regex",

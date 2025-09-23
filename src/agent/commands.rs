@@ -35,10 +35,13 @@ impl CodexAgent {
                         session_configured,
                     }) => (conversation_id, Some(conversation), session_configured),
                     Err(e) => {
-                        let msg = format!("Failed to start new conversation: {}", e);
                         let (tx, rx) = oneshot::channel();
-                        self.send_message_chunk(session_id, msg.into(), tx)?;
-                        let _ = rx.await;
+                        self.send_message_chunk(
+                            session_id,
+                            format!("Failed to start new conversation: {}", e).into(),
+                            tx,
+                        )?;
+                        rx.await.map_err(Error::into_internal_error)?;
                         return Ok(true);
                     }
                 };
@@ -50,7 +53,7 @@ impl CodexAgent {
 
                 let (tx, rx) = oneshot::channel();
                 self.send_message_chunk(session_id, "✨ Started a new conversation".into(), tx)?;
-                let _ = rx.await;
+                rx.await.map_err(Error::into_internal_error)?;
                 return Ok(true);
             }
             "init" => {
@@ -69,7 +72,7 @@ impl CodexAgent {
 
                     let (tx, rx) = oneshot::channel();
                     self.send_message_chunk(session_id, msg.into(), tx)?;
-                    let _ = rx.await;
+                    rx.await.map_err(Error::into_internal_error)?;
                     return Ok(true);
                 }
 
@@ -125,14 +128,14 @@ Notes for Agents
 
                 let (tx, rx) = oneshot::channel();
                 self.send_message_chunk(session_id, msg.into(), tx)?;
-                let _ = rx.await;
+                rx.await.map_err(Error::into_internal_error)?;
                 return Ok(true);
             }
             "status" => {
                 let status_text = self.render_status(&sid_str).await;
                 let (tx, rx) = oneshot::channel();
                 self.send_message_chunk(session_id, status_text.into(), tx)?;
-                let _ = rx.await;
+                rx.await.map_err(Error::into_internal_error)?;
                 return Ok(true);
             }
             "model" => {
@@ -144,7 +147,7 @@ Notes for Agents
                     );
                     let (tx, rx) = oneshot::channel();
                     self.send_message_chunk(session_id, msg.into(), tx)?;
-                    let _ = rx.await;
+                    rx.await.map_err(Error::into_internal_error)?;
                     return Ok(true);
                 }
 
@@ -157,21 +160,25 @@ Notes for Agents
                     effort: None,
                     summary: None,
                 };
+
                 if let Some(conv) = session.conversation.as_ref() {
                     conv.submit(op).await.map_err(Error::into_internal_error)?;
                 } else {
                     let msg = "/model not available without Codex backend";
                     let (tx, rx) = oneshot::channel();
                     self.send_message_chunk(session_id, msg.into(), tx)?;
-                    let _ = rx.await;
+                    rx.await.map_err(Error::into_internal_error)?;
                     return Ok(true);
                 }
 
                 // Provide immediate feedback to the user.
-                let ack = format!("Requested model change to: {}", rest);
                 let (tx, rx) = oneshot::channel();
-                self.send_message_chunk(session_id, ack.into(), tx)?;
-                let _ = rx.await;
+                self.send_message_chunk(
+                    session_id,
+                    format!("🧠 Requested model change to: `{}`", rest).into(),
+                    tx,
+                )?;
+                rx.await.map_err(Error::into_internal_error)?;
                 return Ok(true);
             }
             "approvals" => {
@@ -186,7 +193,7 @@ Notes for Agents
                         let msg = "Usage: /approvals untrusted|on-request|on-failure|never";
                         let (tx, rx) = oneshot::channel();
                         self.send_message_chunk(session_id, msg.into(), tx)?;
-                        let _ = rx.await;
+                        rx.await.map_err(Error::into_internal_error)?;
                         return Ok(true);
                     }
                 };
@@ -208,10 +215,10 @@ Notes for Agents
                             let (tx, rx) = oneshot::channel();
                             self.send_message_chunk(
                                 session_id,
-                                format!("Failed to set approval policy: {}", e).into(),
+                                format!("❌ Failed to set approval policy: {}", e).into(),
                                 tx,
                             )?;
-                            let _ = rx.await;
+                            rx.await.map_err(Error::into_internal_error)?;
                             return Ok(true);
                         }
 
@@ -222,16 +229,19 @@ Notes for Agents
                             state.current_approval = policy;
                         }
 
-                        let msg = format!("Approval policy set to: {}", value);
+                        let msg = format!(
+                            "✅ Approval policy updated to: `{}`. Use `/status` to view current session settings.",
+                            value
+                        );
                         let (tx, rx) = oneshot::channel();
                         self.send_message_chunk(session_id, msg.into(), tx)?;
-                        let _ = rx.await;
+                        rx.await.map_err(Error::into_internal_error)?;
                         Ok(true)
                     } else {
-                        let msg = "Approval policy cannot be set: Codex backend is not available.";
+                        let msg = "⚠️ Unable to set approval policy: Codex backend not connected.";
                         let (tx, rx) = oneshot::channel();
                         self.send_message_chunk(session_id, msg.into(), tx)?;
-                        let _ = rx.await;
+                        rx.await.map_err(Error::into_internal_error)?;
                         Ok(true)
                     }
                 } else {
@@ -239,59 +249,9 @@ Notes for Agents
                     let msg = "Current approval policy: configured per session. Use /approvals <policy> to set.";
                     let (tx, rx) = oneshot::channel();
                     self.send_message_chunk(session_id, msg.into(), tx)?;
-                    let _ = rx.await;
+                    rx.await.map_err(Error::into_internal_error)?;
                     Ok(true)
                 };
-            }
-            "compact" => {
-                session.token_usage = None;
-                let compact_msg = "🧠 Compacting conversation to reduce context size...";
-                if let Some(conv) = session.conversation.as_ref() {
-                    let submit_result = conv.submit(Op::Compact).await;
-                    if let Err(e) = submit_result {
-                        let (tx, rx) = oneshot::channel();
-                        self.send_message_chunk(
-                            session_id,
-                            format!("Failed to submit compact: {}", e).into(),
-                            tx,
-                        )?;
-                        let _ = rx.await;
-                        return Ok(true);
-                    }
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(session_id, compact_msg.into(), tx)?;
-                    let _ = rx.await;
-                    return Ok(true);
-                }
-            }
-            "review" => {
-                session.token_usage = None;
-                let review_msg = "🔍 Asking Codex to review current changes...";
-                if let Some(conv) = session.conversation.as_ref() {
-                    let submit_result = conv
-                        .submit(Op::Review {
-                            review_request: ReviewRequest {
-                                prompt: "review current changes".to_string(),
-                                user_facing_hint: "current changes".to_string(),
-                            },
-                        })
-                        .await;
-                    if let Err(e) = submit_result {
-                        let (tx, rx) = oneshot::channel();
-                        self.send_message_chunk(
-                            session_id,
-                            format!("Failed to submit review: {}", e).into(),
-                            tx,
-                        )?;
-                        let _ = rx.await;
-                        return Ok(true);
-                    }
-
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(session_id, review_msg.into(), tx)?;
-                    let _ = rx.await;
-                    return Ok(true);
-                }
             }
             "quit" => {
                 // Say goodbye and submit Shutdown to Codex if available
@@ -318,6 +278,103 @@ Notes for Agents
             }
             _ => {}
         }
+
+        let mut msg = String::default();
+        // Commands forwarded to Codex as protocol Ops
+        let op = match name {
+            "compact" => {
+                session.token_usage = None;
+                msg = "🧠 Compacting conversation to reduce context size...\n\n".into();
+                Some(Op::Compact)
+            }
+            "review" => {
+                msg = "🔍 Asking Codex to review current changes...\n\n".into();
+                Some(Op::Review {
+                    review_request: ReviewRequest {
+                        prompt: "review current changes".to_string(),
+                        user_facing_hint: "current changes".to_string(),
+                    },
+                })
+            }
+            _ => None,
+        };
+
+        if let Some(op) = op {
+            if let Some(conv) = session.conversation.as_ref() {
+                let submit_result = conv.submit(op).await;
+                if let Err(e) = submit_result {
+                    let (tx, rx) = oneshot::channel();
+                    self.send_message_chunk(
+                        session_id,
+                        format!("Failed to submit message: {}", e).into(),
+                        tx,
+                    )?;
+                    rx.await.map_err(Error::into_internal_error)?;
+                    return Ok(true);
+                }
+
+                let (tx, rx) = oneshot::channel();
+                self.send_message_chunk(session_id, msg.into(), tx)?;
+                rx.await.map_err(Error::into_internal_error)?;
+
+                loop {
+                    let event = conv
+                        .next_event()
+                        .await
+                        .map_err(Error::into_internal_error)?;
+
+                    match event.msg {
+                        EventMsg::TaskStarted(_) => {
+                            let (tx, rx) = oneshot::channel();
+                            self.send_message_chunk(session_id, "Task started...\n\n".into(), tx)?;
+                            rx.await.map_err(Error::into_internal_error)?;
+                        }
+                        EventMsg::EnteredReviewMode(_) => {
+                            let (tx, rx) = oneshot::channel();
+                            self.send_message_chunk(session_id, "Entered review mode".into(), tx)?;
+                            rx.await.map_err(Error::into_internal_error)?;
+                        }
+                        EventMsg::ExitedReviewMode(e) => {
+                            let (tx, rx) = oneshot::channel();
+                            self.send_message_chunk(session_id, "Exited review mode".into(), tx)?;
+                            rx.await.map_err(Error::into_internal_error)?;
+                            if let Some(review_output) = e.review_output {
+                                // TODO: Implement sending review output to the user
+                                info!(?review_output, "Exited review mode")
+                            }
+                            break;
+                        }
+                        EventMsg::TaskComplete(_) | EventMsg::ShutdownComplete => {
+                            let (tx, rx) = oneshot::channel();
+                            self.send_message_chunk(session_id, "Task completed".into(), tx)?;
+                            rx.await.map_err(Error::into_internal_error)?;
+                            break;
+                        }
+                        EventMsg::StreamError(err) => {
+                            let (tx, rx) = oneshot::channel();
+                            let mut msg = err.message;
+                            msg.push_str("\n\n");
+                            self.send_message_chunk(session_id, msg.into(), tx)?;
+                            rx.await.map_err(Error::into_internal_error)?;
+                            continue;
+                        }
+                        EventMsg::Error(err) => {
+                            let (tx, rx) = oneshot::channel();
+                            self.send_message_chunk(session_id, err.message.into(), tx)?;
+                            rx.await.map_err(Error::into_internal_error)?;
+                            break;
+                        }
+                        other => {
+                            let (tx, rx) = oneshot::channel();
+                            self.send_message_chunk(session_id, other.to_string().into(), tx)?;
+                            rx.await.map_err(Error::into_internal_error)?;
+                        }
+                    }
+                }
+            }
+            return Ok(true);
+        }
+
         Ok(false)
     }
 
@@ -405,39 +462,28 @@ Notes for Agents
 📂 Workspace
 
     Path:           {cwd}
-
     Approval Mode:  {approval}
-
     Sandbox:        {sandbox}
-
     AGENTS files:   {agents}
 
 👤 Account
 
     Signed in with: {auth_mode}
-
     Login:          {email}
-
     Plan:           {plan}
 
 🧠 Model
 
     Name:               {model}
-
     Provider:           {provider}
-
     Reasoning Effort:   {effort}
-
     Reasoning Summaries:{summary}
 
 📊 Token Usage
 
     Session ID:     {sid}
-
     Input:          {input}
-
     Output:         {output}
-
     Total:          {total}
 "#,
             cwd = cwd,
