@@ -51,6 +51,14 @@ async fn main() -> Result<()> {
                                 let res = conn.request_permission(req).await;
                                 let _ = tx.send(res);
                             }
+                            Some(agent::ClientOp::ReadTextFile(req, tx)) => {
+                                let res = conn.read_text_file(req).await;
+                                let _ = tx.send(res);
+                            }
+                            Some(agent::ClientOp::WriteTextFile(req, tx)) => {
+                                let res = conn.write_text_file(req).await;
+                                let _ = tx.send(res);
+                            }
                             None => break,
                         }
                     }

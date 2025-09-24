@@ -194,6 +194,14 @@ pub enum ClientOp {
         acp::RequestPermissionRequest,
         Sender<Result<acp::RequestPermissionResponse, Error>>,
     ),
+    ReadTextFile(
+        acp::ReadTextFileRequest,
+        Sender<Result<acp::ReadTextFileResponse, Error>>,
+    ),
+    WriteTextFile(
+        acp::WriteTextFileRequest,
+        Sender<Result<acp::WriteTextFileResponse, Error>>,
+    ),
 }
 
 #[async_trait::async_trait(?Send)]
