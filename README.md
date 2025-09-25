@@ -1,6 +1,6 @@
 # Codex ACP Agent
 
-[![MSRV](https://img.shields.io/badge/MSRV-1.89%2B-blue.svg)](rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.90%2B-blue.svg)](rust-toolchain.toml)
 [![Edition](https://img.shields.io/badge/Edition-2024-blueviolet.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
 
 > This repository is implemented by the `codex` agent.
@@ -17,7 +17,7 @@ An Agent Client Protocol (ACP)–compatible agent that bridges the OpenAI Codex 
 
 ## Requirements
 
-- Rust (Rust 2024 edition; rustc 1.89+ as pinned in `rust-toolchain.toml`).
+- Rust (Rust 2024 edition; rustc 1.90+ as pinned in `rust-toolchain.toml`).
 - Network access for building Git dependencies (Codex workspace, ACP crate).
 
 ## Build

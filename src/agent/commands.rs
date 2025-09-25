@@ -4,7 +4,6 @@ use codex_core::{
     NewConversation,
     protocol::{AskForApproval, Op, ReviewRequest, SandboxPolicy},
 };
-use codex_protocol::config_types::ReasoningEffort;
 use std::{fs, io};
 use tokio::sync::oneshot;
 
@@ -450,13 +449,7 @@ Notes for Agents
         let model = &self.config.model;
         let provider = self.title_case(&self.config.model_provider_id);
         let effort = self.title_case(
-            format!(
-                "{}",
-                self.config
-                    .model_reasoning_effort
-                    .unwrap_or(ReasoningEffort::Medium)
-            )
-            .as_str(),
+            format!("{}", self.config.model_reasoning_effort.unwrap_or_default()).as_str(),
         );
         let summary = self.title_case(format!("{}", self.config.model_reasoning_summary).as_str());
 
@@ -474,10 +467,10 @@ Notes for Agents
             r#"
 📂 Workspace
 
-    Path:           {cwd}
-    Approval Mode:  {approval}
-    Sandbox:        {sandbox}
-    AGENTS files:   {agents}
+    Path:          {cwd}
+    Approval Mode: {approval}
+    Sandbox:       {sandbox}
+    AGENTS files:  {agents}
 
 👤 Account
 
@@ -487,10 +480,10 @@ Notes for Agents
 
 🧠 Model
 
-    Name:               {model}
-    Provider:           {provider}
-    Reasoning Effort:   {effort}
-    Reasoning Summaries:{summary}
+    Name:                {model}
+    Provider:            {provider}
+    Reasoning Effort:    {effort}
+    Reasoning Summaries: {summary}
 
 📊 Token Usage
 
