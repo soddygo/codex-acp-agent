@@ -1,10 +1,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
+use std::sync::{Arc, LazyLock, RwLock};
 
 use agent_client_protocol::{self as acp, Agent, Error, V1};
+use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
     AuthManager, CodexConversation, ConversationManager, NewConversation,
     config::Config as CodexConfig,
@@ -12,24 +12,24 @@ use codex_core::{
         AskForApproval, EventMsg, InputItem, Op, ReviewDecision, SandboxPolicy, TokenUsage,
     },
 };
-use codex_protocol::mcp_protocol::AuthMode;
+use codex_protocol::mcp_protocol::{AuthMode, ConversationId};
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot, oneshot::Sender};
 use tokio::task;
 use tracing::{info, warn};
 
 mod commands;
+
+static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
+
 // Placeholder for per-session state. Holds the Codex conversation
 // handle, its id (for status/reporting), and bookkeeping for streaming.
 #[derive(Clone)]
 struct SessionState {
-    #[allow(dead_code)]
-    created: SystemTime,
     // Conversation id string for display/logging purposes.
-    conversation_id: String,
-    conversation: Option<Arc<CodexConversation>>,
     current_approval: AskForApproval,
     current_sandbox: SandboxPolicy,
+    current_mode: acp::SessionModeId,
     token_usage: Option<TokenUsage>,
     reasoning_sections: Vec<String>,
     current_reasoning_chunk: String,
@@ -41,10 +41,8 @@ pub struct CodexAgent {
     config: CodexConfig,
     conversation_manager: ConversationManager,
     auth_manager: Arc<RwLock<Arc<AuthManager>>>,
-    available_commands: Vec<acp::AvailableCommand>,
     client_tx: mpsc::UnboundedSender<ClientOp>,
     client_capabilities: RefCell<acp::ClientCapabilities>,
-    next_session_id: RefCell<u64>,
 }
 
 impl CodexAgent {
@@ -62,11 +60,54 @@ impl CodexAgent {
             config,
             conversation_manager,
             auth_manager: Arc::new(RwLock::new(auth)),
-            available_commands: commands::built_in_commands(),
             client_tx,
             client_capabilities: RefCell::new(Default::default()),
-            next_session_id: RefCell::new(1),
         }
+    }
+
+    fn modes(config: &CodexConfig) -> Option<acp::SessionModeState> {
+        let current_mode_id = APPROVAL_PRESETS
+            .iter()
+            .find(|preset| {
+                preset.approval == config.approval_policy && preset.sandbox == config.sandbox_policy
+            })
+            .map(|preset| acp::SessionModeId(preset.id.into()))?;
+
+        Some(acp::SessionModeState {
+            current_mode_id,
+            available_modes: APPROVAL_PRESETS
+                .iter()
+                .map(|preset| acp::SessionMode {
+                    id: acp::SessionModeId(preset.id.into()),
+                    name: preset.label.to_owned(),
+                    description: Some(preset.description.to_owned()),
+                    meta: None,
+                })
+                .collect(),
+            meta: None,
+        })
+    }
+
+    async fn get_conversation(
+        &self,
+        session_id: &acp::SessionId,
+    ) -> Result<Arc<CodexConversation>, Error> {
+        if !self
+            .sessions
+            .borrow()
+            .contains_key(&session_id.0.to_string())
+        {
+            return Err(Error::invalid_params().with_data("session not found"));
+        }
+
+        // Get the session to find the conversation ID
+        let conversation_id = ConversationId::from_string(session_id.0.as_ref())
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.conversation_manager
+            .get_conversation(conversation_id)
+            .await
+            .map_err(|e| anyhow::anyhow!(e).into())
     }
 
     pub fn send_message_chunk(
@@ -283,60 +324,48 @@ impl Agent for CodexAgent {
         args: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, Error> {
         info!(?args, "Received new session request");
-        let session_id = {
-            let mut next_id = self.next_session_id.borrow_mut();
-            let session_id = next_id.to_string();
-            *next_id += 1;
-            session_id
+        // Start a new Codex conversation for this session
+        let conversation_id = match self
+            .conversation_manager
+            .new_conversation(self.config.clone())
+            .await
+        {
+            Ok(NewConversation {
+                conversation_id, ..
+            }) => conversation_id,
+            Err(e) => {
+                warn!(error = %e, "Failed to create Codex conversation");
+                return Err(Error::into_internal_error(e));
+            }
         };
 
+        let modes = Self::modes(&self.config);
+        let current_mode = modes
+            .as_ref()
+            .map(|m| m.current_mode_id.clone())
+            .unwrap_or(acp::SessionModeId("auto".into()));
+
+        let session_id = conversation_id.to_string();
         // Populate a placeholder session entry prior to spawning Codex so that
         // pipelined requests (like an immediate `/status`) see the session.
         self.sessions.borrow_mut().insert(
             session_id.clone(),
             SessionState {
-                created: SystemTime::now(),
-                conversation_id: String::new(),
-                conversation: None,
-                current_approval: AskForApproval::OnRequest,
-                current_sandbox: SandboxPolicy::new_workspace_write_policy(),
+                current_approval: self.config.approval_policy,
+                current_sandbox: self.config.sandbox_policy.clone(),
+                current_mode,
                 token_usage: None,
                 reasoning_sections: Vec::new(),
                 current_reasoning_chunk: String::new(),
             },
         );
 
-        // Start a new Codex conversation for this session
-        let (conversation, session_configured) = match self
-            .conversation_manager
-            .new_conversation(self.config.clone())
-            .await
-        {
-            Ok(NewConversation {
-                conversation,
-                session_configured,
-                ..
-            }) => (conversation, session_configured),
-            Err(e) => {
-                warn!(error = %e, "Failed to create Codex conversation");
-                self.sessions.borrow_mut().remove(&session_id);
-                return Err(Error::into_internal_error(e));
-            }
-        };
-
-        if let Ok(mut sessions) = self.sessions.try_borrow_mut()
-            && let Some(state) = sessions.get_mut(&session_id)
-        {
-            state.conversation_id = session_configured.session_id.to_string();
-            state.conversation = Some(conversation.clone());
-        }
-
         // Advertise available slash commands to the client right after
         // the session is created. Send it asynchronously to avoid racing
         // with the NewSessionResponse delivery.
         {
             let session_id = session_id.clone();
-            let available_commands = self.available_commands.clone();
+            let available_commands = commands::AVAILABLE_COMMANDS.to_vec();
             let tx_updates = self.session_update_tx.clone();
             task::spawn_local(async move {
                 let (tx, rx) = oneshot::channel();
@@ -354,30 +383,7 @@ impl Agent for CodexAgent {
 
         Ok(acp::NewSessionResponse {
             session_id: acp::SessionId(session_id.into()),
-            modes: Some(acp::SessionModeState {
-                current_mode_id: acp::SessionModeId("auto".into()),
-                available_modes: vec![
-                    acp::SessionMode {
-                        id: acp::SessionModeId("read-only".into()),
-                        name: "Read Only".to_string(),
-                        description: Some("Codex can read files and answer questions. Codex requires approval to make edits, run commands, or access network".to_string()),
-                        meta: None,
-                    },
-                    acp::SessionMode {
-                        id: acp::SessionModeId("auto".into()),
-                        name: "Auto".to_string(),
-                        description: Some("Codex can read files, make edits, and run commands in the workspace. Codex requires approval to work outside the workspace or access network".to_string()),
-                        meta: None,
-                    },
-                    acp::SessionMode {
-                        id: acp::SessionModeId("full-access".into()),
-                        name: "Full Access".to_string(),
-                        description: Some("Codex can read files, make edits, and run commands with network access, without approval. Exercise caution".to_string()),
-                        meta: None,
-                    },
-                ],
-                meta: None,
-            }),
+            modes,
             meta: None,
         })
     }
@@ -398,38 +404,40 @@ impl Agent for CodexAgent {
         args: acp::SetSessionModeRequest,
     ) -> Result<acp::SetSessionModeResponse, Error> {
         info!(?args, "Received set session mode request");
-        // Validate session exists
-        let session_id = args.session_id.0.to_string();
-        if !self.sessions.borrow().contains_key(&session_id) {
-            return Err(Error::invalid_params());
+        let preset = APPROVAL_PRESETS
+            .iter()
+            .find(|preset| args.mode_id.0.as_ref() == preset.id)
+            .ok_or_else(Error::invalid_params)?;
+
+        self.get_conversation(&args.session_id)
+            .await?
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: Some(preset.approval),
+                sandbox_policy: Some(preset.sandbox.clone()),
+                model: None,
+                effort: None,
+                summary: None,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        if let Some(state) = self
+            .sessions
+            .borrow_mut()
+            .get_mut(&args.session_id.0.to_string())
+        {
+            state.current_approval = preset.approval;
+            state.current_sandbox = preset.sandbox.clone();
+            state.current_mode = args.mode_id.clone();
         }
 
-        let tx_updates = self.session_update_tx.clone();
-        task::spawn_local(async move {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx_updates.send((
-                acp::SessionNotification {
-                    session_id: args.session_id.clone(),
-                    update: acp::SessionUpdate::CurrentModeUpdate {
-                        current_mode_id: args.mode_id,
-                    },
-                    meta: None,
-                },
-                tx,
-            ));
-            let _ = rx.await;
-        });
-        // Notify client about the new current mode immediately.
-        Ok(acp::SetSessionModeResponse { meta: None })
+        Ok(acp::SetSessionModeResponse::default())
     }
 
     async fn prompt(&self, args: acp::PromptRequest) -> Result<acp::PromptResponse, Error> {
         info!(?args, "Received prompt request");
-        let session_id = args.session_id.0.to_string();
-        let session = match self.sessions.borrow().get(&session_id) {
-            Some(s) => s.clone(),
-            None => return Err(Error::invalid_params().with_data("Session not found")),
-        };
+        let conversation = self.get_conversation(&args.session_id).await?;
 
         // Handle slash commands (e.g., "/status") when the first block is text starting with '/'
         if let Some(acp::ContentBlock::Text(t)) = args.prompt.first() {
@@ -449,21 +457,6 @@ impl Agent for CodexAgent {
                 }
             }
         }
-
-        // Ensure we have a Codex conversation for non-slash content.
-        let conversation = match session.conversation.as_ref() {
-            Some(conv) => conv.clone(),
-            None => {
-                let msg = "No Codex backend available. Use slash commands like /status";
-                let (tx, rx) = oneshot::channel();
-                self.send_message_chunk(&args.session_id, msg.into(), tx)?;
-                let _ = rx.await;
-                return Ok(acp::PromptResponse {
-                    stop_reason: acp::StopReason::EndTurn,
-                    meta: None,
-                });
-            }
-        };
 
         self.reset_reasoning_tracking(&args.session_id);
 
@@ -582,7 +575,7 @@ impl Agent for CodexAgent {
                         && !text.trim().is_empty()
                     {
                         let (tx, rx) = oneshot::channel();
-                        self.send_thought_chunk(&args.session_id, text.into(), tx)?;
+                        self.send_thought_chunk(&args.session_id, text.clone().into(), tx)?;
                         rx.await.map_err(Error::into_internal_error)?;
                     }
                 }
@@ -790,7 +783,7 @@ impl Agent for CodexAgent {
                             FC::Add { content } => {
                                 contents.push(acp::ToolCallContent::from(acp::Diff {
                                     path: path.clone(),
-                                    old_text: Some("".into()),
+                                    old_text: None,
                                     new_text: content.clone(),
                                     meta: None,
                                 }));
@@ -857,11 +850,10 @@ impl Agent for CodexAgent {
                     }
                 }
                 EventMsg::TokenCount(tc) => {
-                    if let Some(info) = tc.info
-                        && let Ok(mut map) = self.sessions.try_borrow_mut()
-                        && let Some(state) = map.get_mut(&session_id)
-                    {
-                        state.token_usage = Some(info.total_token_usage.clone());
+                    if let Some(info) = tc.info {
+                        self.with_session_state_mut(&args.session_id, |state| {
+                            state.token_usage = Some(info.total_token_usage.clone());
+                        });
                     }
                 }
                 EventMsg::TaskComplete(_) => {
@@ -902,28 +894,14 @@ impl Agent for CodexAgent {
         info!(?args, "Received cancel request");
         let session_id = args.session_id.0.to_string();
         // Scope borrow to avoid RefCell issues across await
-        let conv_opt = {
-            let sessions = self.sessions.borrow();
-            sessions
-                .get(&session_id)
-                .and_then(|s| s.conversation.clone())
-        };
-        match conv_opt {
-            Some(conv) => {
-                // Best-effort: we don't need the submission id here.
-                let _ = conv.submit(Op::Interrupt).await;
-                // Remove session from cache after interrupt
-                self.sessions.borrow_mut().remove(&session_id);
-                Ok(())
-            }
-            None => {
-                warn!(
-                    session_id,
-                    "Cancel called but no active Codex conversation found"
-                );
-                Err(Error::invalid_params().with_data("No active Codex backend for cancel"))
-            }
-        }
+        let conv = self.get_conversation(&args.session_id).await?;
+        // Best-effort: we don't need the submission id here.
+        conv.submit(Op::Interrupt)
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!("failed to send interrupt: {}", e)))?;
+        // Remove session from cache after interrupt
+        self.sessions.borrow_mut().remove(&session_id);
+        Ok(())
     }
 
     async fn ext_method(&self, args: acp::ExtRequest) -> Result<acp::ExtResponse, Error> {
