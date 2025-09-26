@@ -2,12 +2,13 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use agent_client_protocol::{self as acp, Agent, Error, V1};
 use codex_core::{
     AuthManager, CodexConversation, ConversationManager, NewConversation,
     config::Config as CodexConfig,
+    config_types::McpServerConfig,
     protocol::{
         AskForApproval, EventMsg, InputItem, Op, ReviewDecision, SandboxPolicy, TokenUsage,
     },
@@ -17,6 +18,8 @@ use serde_json::json;
 use tokio::sync::{mpsc, oneshot, oneshot::Sender};
 use tokio::task;
 use tracing::{info, warn};
+
+use crate::fs_bridge::FsBridge;
 
 mod commands;
 // Placeholder for per-session state. Holds the Codex conversation
@@ -45,13 +48,40 @@ pub struct CodexAgent {
     client_tx: mpsc::UnboundedSender<ClientOp>,
     client_capabilities: RefCell<acp::ClientCapabilities>,
     next_session_id: RefCell<u64>,
+    fs_bridge: Option<Arc<FsBridge>>,
 }
 
 impl CodexAgent {
+    fn prepare_fs_mcp_server_config(
+        &self,
+        session_id: &str,
+        bridge: &FsBridge,
+    ) -> Result<McpServerConfig, Error> {
+        let exe_path = std::env::current_exe().map_err(|err| {
+            Error::internal_error().with_data(format!("failed to locate agent binary: {err}"))
+        })?;
+
+        let mut env = HashMap::new();
+        env.insert(
+            "ACP_FS_BRIDGE_ADDR".to_string(),
+            bridge.address().to_string(),
+        );
+        env.insert("ACP_FS_SESSION_ID".to_string(), session_id.to_string());
+
+        Ok(McpServerConfig {
+            command: exe_path.to_string_lossy().into_owned(),
+            args: vec!["--acp-fs-mcp".to_string()],
+            env: Some(env),
+            startup_timeout_sec: Some(Duration::from_secs(5)),
+            tool_timeout_sec: Some(Duration::from_secs(30)),
+        })
+    }
+
     pub fn with_config(
         session_update_tx: mpsc::UnboundedSender<(acp::SessionNotification, Sender<()>)>,
         client_tx: mpsc::UnboundedSender<ClientOp>,
         config: CodexConfig,
+        fs_bridge: Option<Arc<FsBridge>>,
     ) -> Self {
         let auth = AuthManager::shared(config.codex_home.clone());
         let conversation_manager = ConversationManager::new(auth.clone());
@@ -66,6 +96,7 @@ impl CodexAgent {
             client_tx,
             client_capabilities: RefCell::new(Default::default()),
             next_session_id: RefCell::new(1),
+            fs_bridge,
         }
     }
 
@@ -315,9 +346,36 @@ impl Agent for CodexAgent {
         );
 
         // Start a new Codex conversation for this session
+        let mut session_config = self.config.clone();
+        let fs_guidance = "Use the MCP tools `read_text_file` and `write_text_file` (server `acp_fs`) for file access; avoid shelling out with commands like `cat` or `tee`.";
+        session_config.base_instructions = match session_config.base_instructions.take() {
+            Some(mut existing) => {
+                if !existing.trim().ends_with(fs_guidance) {
+                    existing.push_str("\n\n");
+                    existing.push_str(fs_guidance);
+                }
+                Some(existing)
+            }
+            None => Some(fs_guidance.to_string()),
+        };
+
+        if let Some(bridge) = &self.fs_bridge {
+            match self.prepare_fs_mcp_server_config(&session_id, bridge.as_ref()) {
+                Ok(server_config) => {
+                    session_config
+                        .mcp_servers
+                        .insert("acp_fs".to_string(), server_config);
+                }
+                Err(err) => {
+                    self.sessions.borrow_mut().remove(&session_id);
+                    return Err(err);
+                }
+            }
+        }
+
         let (conversation, session_configured) = match self
             .conversation_manager
-            .new_conversation(self.config.clone())
+            .new_conversation(session_config)
             .await
         {
             Ok(NewConversation {

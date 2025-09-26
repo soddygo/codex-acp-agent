@@ -1,4 +1,7 @@
 mod agent;
+mod fs_bridge;
+mod mcp_fs_server;
+
 use agent_client_protocol::{AgentSideConnection, Client};
 use anyhow::Result;
 use tokio::{io, sync::mpsc, task};
@@ -11,6 +14,10 @@ use codex_core::config::{Config, ConfigOverrides};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--acp-fs-mcp") {
+        return mcp_fs_server::run().await;
+    }
+
     // Initialize tracing with env filter (RUST_LOG compatible).
     let filter = EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("info"))?;
     tracing_subscriber::registry()
@@ -27,7 +34,8 @@ async fn main() -> Result<()> {
         let (client_tx, mut client_rx) = mpsc::unbounded_channel();
 
         let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default())?;
-        let agent = CodexAgent::with_config(tx, client_tx.clone(), config);
+        let fs_bridge = fs_bridge::FsBridge::start(client_tx.clone(), config.cwd.clone()).await?;
+        let agent = CodexAgent::with_config(tx, client_tx.clone(), config, Some(fs_bridge));
         let (conn, handle_io) = AgentSideConnection::new(agent, outgoing, incoming, |fut| {
             task::spawn_local(fut);
         });
