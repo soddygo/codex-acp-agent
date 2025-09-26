@@ -1,8 +1,7 @@
 mod agent;
-mod fs_bridge;
-mod mcp_fs_server;
+mod fs;
 
-use agent_client_protocol::{AgentSideConnection, Client};
+use agent_client_protocol::{AgentSideConnection, Client, Error};
 use anyhow::Result;
 use tokio::{io, sync::mpsc, task};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
@@ -15,7 +14,7 @@ use codex_core::config::{Config, ConfigOverrides};
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("--acp-fs-mcp") {
-        return mcp_fs_server::run().await;
+        return fs::run_mcp_server().await;
     }
 
     // Initialize tracing with env filter (RUST_LOG compatible).
@@ -34,8 +33,9 @@ async fn main() -> Result<()> {
         let (client_tx, mut client_rx) = mpsc::unbounded_channel();
 
         let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default())?;
-        let fs_bridge = fs_bridge::FsBridge::start(client_tx.clone(), config.cwd.clone()).await?;
+        let fs_bridge = fs::FsBridge::start(client_tx.clone(), config.cwd.clone()).await?;
         let agent = CodexAgent::with_config(tx, client_tx.clone(), config, Some(fs_bridge));
+        let session_modes = agent.session_mode_lookup();
         let (conn, handle_io) = AgentSideConnection::new(agent, outgoing, incoming, |fut| {
             task::spawn_local(fut);
         });
@@ -64,8 +64,14 @@ async fn main() -> Result<()> {
                                 let _ = tx.send(res);
                             }
                             Some(agent::ClientOp::WriteTextFile(req, tx)) => {
-                                let res = conn.write_text_file(req).await;
-                                let _ = tx.send(res);
+                                if session_modes.is_read_only(&req.session_id) {
+                                    let err = Error::invalid_params()
+                                        .with_data("write_text_file is disabled while session mode is read-only");
+                                    let _ = tx.send(Err(err));
+                                } else {
+                                    let res = conn.write_text_file(req).await;
+                                    let _ = tx.send(res);
+                                }
                             }
                             None => break,
                         }

@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot, oneshot::Sender};
 use tokio::task;
 use tracing::{info, warn};
 
-use crate::fs_bridge::FsBridge;
+use crate::fs::FsBridge;
 
 mod commands;
 // Placeholder for per-session state. Holds the Codex conversation
@@ -33,9 +33,30 @@ struct SessionState {
     conversation: Option<Arc<CodexConversation>>,
     current_approval: AskForApproval,
     current_sandbox: SandboxPolicy,
+    current_mode: acp::SessionModeId,
     token_usage: Option<TokenUsage>,
     reasoning_sections: Vec<String>,
     current_reasoning_chunk: String,
+}
+
+#[derive(Clone)]
+pub struct SessionModeLookup {
+    inner: Rc<RefCell<HashMap<String, SessionState>>>,
+}
+
+impl SessionModeLookup {
+    pub fn current_mode(&self, session_id: &acp::SessionId) -> Option<acp::SessionModeId> {
+        self.inner
+            .borrow()
+            .get(session_id.0.as_ref())
+            .map(|state| state.current_mode.clone())
+    }
+
+    pub fn is_read_only(&self, session_id: &acp::SessionId) -> bool {
+        self.current_mode(session_id)
+            .map(|mode| mode.0.as_ref() == "read-only")
+            .unwrap_or(false)
+    }
 }
 
 pub struct CodexAgent {
@@ -97,6 +118,12 @@ impl CodexAgent {
             client_capabilities: RefCell::new(Default::default()),
             next_session_id: RefCell::new(1),
             fs_bridge,
+        }
+    }
+
+    pub fn session_mode_lookup(&self) -> SessionModeLookup {
+        SessionModeLookup {
+            inner: self.sessions.clone(),
         }
     }
 
@@ -339,6 +366,7 @@ impl Agent for CodexAgent {
                 conversation: None,
                 current_approval: AskForApproval::OnRequest,
                 current_sandbox: SandboxPolicy::new_workspace_write_policy(),
+                current_mode: acp::SessionModeId("auto".into()),
                 token_usage: None,
                 reasoning_sections: Vec::new(),
                 current_reasoning_chunk: String::new(),
@@ -465,19 +493,25 @@ impl Agent for CodexAgent {
     ) -> Result<acp::SetSessionModeResponse, Error> {
         info!(?args, "Received set session mode request");
         // Validate session exists
-        let session_id = args.session_id.0.to_string();
-        if !self.sessions.borrow().contains_key(&session_id) {
+        let session_id_key = args.session_id.0.to_string();
+        if !self.sessions.borrow().contains_key(&session_id_key) {
             return Err(Error::invalid_params());
         }
+
+        let session_id = args.session_id.clone();
+        let mode_id = args.mode_id.clone();
+        self.with_session_state_mut(&session_id, |state| {
+            state.current_mode = mode_id.clone();
+        });
 
         let tx_updates = self.session_update_tx.clone();
         task::spawn_local(async move {
             let (tx, rx) = oneshot::channel();
             let _ = tx_updates.send((
                 acp::SessionNotification {
-                    session_id: args.session_id.clone(),
+                    session_id: session_id.clone(),
                     update: acp::SessionUpdate::CurrentModeUpdate {
-                        current_mode_id: args.mode_id,
+                        current_mode_id: mode_id,
                     },
                     meta: None,
                 },

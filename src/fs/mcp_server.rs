@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
 
-use crate::fs_bridge;
+use super::bridge;
 use mcp_types::MCP_SCHEMA_VERSION;
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -160,7 +160,7 @@ async fn handle_tool_call(
             let response = perform_bridge_request(
                 bridge_addr,
                 session_id,
-                fs_bridge::BridgeOp::Read,
+                bridge::BridgeOp::Read,
                 path,
                 line,
                 limit,
@@ -186,7 +186,7 @@ async fn handle_tool_call(
             perform_bridge_request(
                 bridge_addr,
                 session_id,
-                fs_bridge::BridgeOp::Write,
+                bridge::BridgeOp::Write,
                 path,
                 None,
                 None,
@@ -207,7 +207,7 @@ async fn handle_tool_call(
 async fn perform_bridge_request(
     bridge_addr: &str,
     session_id: &str,
-    op: fs_bridge::BridgeOp,
+    op: bridge::BridgeOp,
     path: &str,
     line: Option<u32>,
     limit: Option<u32>,
@@ -224,8 +224,8 @@ async fn perform_bridge_request(
         "id": request_id,
         "session_id": session_id,
         "op": match op {
-            fs_bridge::BridgeOp::Read => "read",
-            fs_bridge::BridgeOp::Write => "write",
+            bridge::BridgeOp::Read => "read",
+            bridge::BridgeOp::Write => "write",
         },
         "path": path,
         "line": line,
