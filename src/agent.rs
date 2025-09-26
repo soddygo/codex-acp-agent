@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
@@ -10,7 +11,8 @@ use codex_core::{
     config::Config as CodexConfig,
     config_types::McpServerConfig,
     protocol::{
-        AskForApproval, EventMsg, InputItem, Op, ReviewDecision, SandboxPolicy, TokenUsage,
+        AskForApproval, EventMsg, InputItem, McpInvocation, Op, ReviewDecision, SandboxPolicy,
+        TokenUsage,
     },
 };
 use codex_protocol::mcp_protocol::AuthMode;
@@ -244,6 +246,79 @@ impl CodexAgent {
         })
         .flatten()
     }
+
+    fn describe_mcp_tool(
+        &self,
+        invocation: &McpInvocation,
+    ) -> (String, Vec<acp::ToolCallLocation>) {
+        if let Some(metadata) = self.fs_tool_metadata(invocation) {
+            let FsToolMetadata {
+                display_path,
+                location_path,
+                line,
+            } = metadata;
+            let location = acp::ToolCallLocation {
+                path: location_path,
+                line,
+                meta: None,
+            };
+            (
+                format!("{}.{} ({display_path})", invocation.server, invocation.tool),
+                vec![location],
+            )
+        } else {
+            (
+                format!("{}.{}", invocation.server, invocation.tool),
+                Vec::new(),
+            )
+        }
+    }
+
+    fn fs_tool_metadata(&self, invocation: &McpInvocation) -> Option<FsToolMetadata> {
+        if invocation.server != "acp_fs" {
+            return None;
+        }
+
+        match invocation.tool.as_str() {
+            "read_text_file" | "write_text_file" => {}
+            _ => return None,
+        }
+
+        let args = invocation.arguments.as_ref()?.as_object()?;
+        let path = args.get("path")?.as_str()?.to_string();
+        let line = args
+            .get("line")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as u32);
+        let display_path = self.display_fs_path(&path);
+        let location_path = PathBuf::from(&path);
+
+        Some(FsToolMetadata {
+            display_path,
+            location_path,
+            line,
+        })
+    }
+
+    fn display_fs_path(&self, raw_path: &str) -> String {
+        let path = Path::new(raw_path);
+        if let Ok(relative) = path.strip_prefix(&self.config.cwd) {
+            let rel_display = relative.display().to_string();
+            if !rel_display.is_empty() {
+                return rel_display;
+            }
+        }
+
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| raw_path.to_string())
+    }
+}
+
+struct FsToolMetadata {
+    display_path: String,
+    location_path: PathBuf,
+    line: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -375,7 +450,7 @@ impl Agent for CodexAgent {
 
         // Start a new Codex conversation for this session
         let mut session_config = self.config.clone();
-        let fs_guidance = "For workspace file I/O, use the acp_fs MCP tools read_text_file and write_text_file. Avoid shell commands for reading or writing files.";
+        let fs_guidance = "For workspace file I/O, use the acp_fs MCP tool read_text_file for reads. Avoid shell commands for file access. Prefer applying patches (apply_patch or similar) for incremental edits; reserve acp_fs.write_text_file for creating files or replacing an entire file's contents when a full write is unavoidable.";
 
         if let Some(mut base) = session_config.base_instructions.take() {
             if !base.contains("acp_fs") {
@@ -710,14 +785,14 @@ impl Agent for CodexAgent {
                 }
                 // MCP tool calls → ACP ToolCall/ToolCallUpdate
                 EventMsg::McpToolCallBegin(begin) => {
-                    let title = format!("{}.{}", begin.invocation.server, begin.invocation.tool);
+                    let (title, locations) = self.describe_mcp_tool(&begin.invocation);
                     let tool = acp::ToolCall {
                         id: acp::ToolCallId(begin.call_id.clone().into()),
                         title,
                         kind: acp::ToolKind::Fetch,
                         status: acp::ToolCallStatus::InProgress,
                         content: Vec::new(),
-                        locations: Vec::new(),
+                        locations,
                         raw_input: begin.invocation.arguments,
                         raw_output: None,
                         meta: None,
@@ -743,14 +818,17 @@ impl Agent for CodexAgent {
                         acp::ToolCallStatus::Failed
                     };
                     let raw_output = serde_json::to_value(&end.result).ok();
+                    let (title, locations) = self.describe_mcp_tool(&end.invocation);
                     let update = acp::ToolCallUpdate {
                         id: acp::ToolCallId(end.call_id.clone().into()),
                         fields: acp::ToolCallUpdateFields {
                             status: Some(status),
-                            title: Some(format!(
-                                "{}.{}",
-                                end.invocation.server, end.invocation.tool
-                            )),
+                            title: Some(title),
+                            locations: if locations.is_empty() {
+                                None
+                            } else {
+                                Some(locations)
+                            },
                             raw_output,
                             ..Default::default()
                         },
