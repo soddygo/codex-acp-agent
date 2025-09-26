@@ -57,7 +57,7 @@
 
 You have access to multiple MCP servers to help you come with the best implementation:
 
-- `acp`: Agent Client Protocol repository. Main entry to get documentation about the Agent Client Protocol. Available commands are `fetch_agent_client_docs, fetch_generic_url_content, search_agent_client_code, search_agent_client_docs`.
+- `acp`: Agent Client Protocol (ACP) repository. Main source of truth for documentation about the Agent Client Protocol. Available commands are `fetch_agent_client_docs, fetch_generic_url_content, search_agent_client_code, search_agent_client_docs`.
 - `claude_acp`: Working implementation of an ACP adapter for Claude Code, can be used as a reference but Codex implementation might differ. Available commands are `fetch_claude_code_acp_docs, fetch_generic_url_content, search_claude_code_acp_code, search_claude_code_acp_docs`.
 - `codex_rust`: Rust repository of the Codex implementation. Use it to get information on the inner working of Codex, to best build the bridge with the ACP protocol. Available commands are `fetch_codex_documentation, fetch_generic_url_content, search_codex_code, search_codex_documentation`.
 

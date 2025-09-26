@@ -375,6 +375,7 @@ impl Agent for CodexAgent {
 
         // Start a new Codex conversation for this session
         let mut session_config = self.config.clone();
+        /*
         let fs_guidance = "Use the MCP tools `read_text_file` and `write_text_file` (server `acp_fs`) for file access; avoid shelling out with commands like `cat` or `tee`.";
         session_config.base_instructions = match session_config.base_instructions.take() {
             Some(mut existing) => {
@@ -386,6 +387,7 @@ impl Agent for CodexAgent {
             }
             None => Some(fs_guidance.to_string()),
         };
+        */
 
         if let Some(bridge) = &self.fs_bridge {
             match self.prepare_fs_mcp_server_config(&session_id, bridge.as_ref()) {
