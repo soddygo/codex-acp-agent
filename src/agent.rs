@@ -375,19 +375,30 @@ impl Agent for CodexAgent {
 
         // Start a new Codex conversation for this session
         let mut session_config = self.config.clone();
-        /*
-        let fs_guidance = "Use the MCP tools `read_text_file` and `write_text_file` (server `acp_fs`) for file access; avoid shelling out with commands like `cat` or `tee`.";
-        session_config.base_instructions = match session_config.base_instructions.take() {
-            Some(mut existing) => {
-                if !existing.trim().ends_with(fs_guidance) {
-                    existing.push_str("\n\n");
-                    existing.push_str(fs_guidance);
+        let fs_guidance = "For workspace file I/O, use the acp_fs MCP tools read_text_file and write_text_file. Avoid shell commands for reading or writing files.";
+
+        if let Some(mut base) = session_config.base_instructions.take() {
+            if !base.contains("acp_fs") {
+                if !base.trim_end().is_empty() {
+                    base.push_str("\n\n");
                 }
-                Some(existing)
+                base.push_str(fs_guidance);
             }
-            None => Some(fs_guidance.to_string()),
-        };
-        */
+            session_config.base_instructions = Some(base);
+        } else {
+            session_config.user_instructions = match session_config.user_instructions.take() {
+                Some(mut existing) => {
+                    if !existing.contains("acp_fs") {
+                        if !existing.trim_end().is_empty() {
+                            existing.push_str("\n\n");
+                        }
+                        existing.push_str(fs_guidance);
+                    }
+                    Some(existing)
+                }
+                None => Some(fs_guidance.to_string()),
+            };
+        }
 
         if let Some(bridge) = &self.fs_bridge {
             match self.prepare_fs_mcp_server_config(&session_id, bridge.as_ref()) {
