@@ -453,9 +453,9 @@ impl Agent for CodexAgent {
         let fs_guidance = "For workspace file I/O, use the acp_fs MCP tools.
 Follow this workflow:
 1. Call read_text_file to capture the current content (and a hash if helpful).
-2. Compute edits locally without mutating files via shell commands.
-3. If you need to present diffs, invoke the apply_patch tool (never the shell apply_patch binary).
-4. Write the full merged content back with write_text_file, and if the client rejects because the file changed, re-read and retry.";
+2. Plan edits locally instead of mutating files via shell commands.
+3. Stage replacements with edit_text_file (or multi_edit_text_file for multiple sequential edits) so the bridge can validate them and surface unified diffs.
+4. Call write_text_file once to persist the staged content. If the client rejects because the file changed, read again to refresh your view and restage.";
 
         if let Some(mut base) = session_config.base_instructions.take() {
             if !base.contains("acp_fs") {
