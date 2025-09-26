@@ -450,7 +450,12 @@ impl Agent for CodexAgent {
 
         // Start a new Codex conversation for this session
         let mut session_config = self.config.clone();
-        let fs_guidance = "For workspace file I/O, use the acp_fs MCP tool read_text_file for reads. Avoid shell commands for file access. Prefer applying patches (apply_patch or similar) for incremental edits; reserve acp_fs.write_text_file for creating files or replacing an entire file's contents when a full write is unavoidable.";
+        let fs_guidance = "For workspace file I/O, use the acp_fs MCP tools.
+Follow this workflow:
+1. Call read_text_file to capture the current content (and a hash if helpful).
+2. Compute edits locally without mutating files via shell commands.
+3. If you need to present diffs, invoke the apply_patch tool (never the shell apply_patch binary).
+4. Write the full merged content back with write_text_file, and if the client rejects because the file changed, re-read and retry.";
 
         if let Some(mut base) = session_config.base_instructions.take() {
             if !base.contains("acp_fs") {
