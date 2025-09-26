@@ -552,16 +552,14 @@ Notes for Agents
             let path = self.config.cwd.join(candidate);
             let mut found = false;
 
-            if let Some(session_id) = session_id {
-                if self.client_supports_fs_read() {
-                    if self
-                        .client_read_text_file(session_id, path.clone(), Some(1), Some(1))
-                        .await
-                        .is_ok()
-                    {
-                        found = true;
-                    }
-                }
+            if let Some(session_id) = session_id
+                && self.client_supports_fs_read()
+                && self
+                    .client_read_text_file(session_id, path.clone(), Some(1), Some(1))
+                    .await
+                    .is_ok()
+            {
+                found = true;
             }
 
             if !found && path.exists() {
