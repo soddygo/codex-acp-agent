@@ -263,7 +263,7 @@ impl FsBridgeInner {
 
         match rx.await {
             Ok(Ok(resp)) => Ok(resp.content),
-            Ok(Err(err)) => Err(format!("{}", err.message)),
+            Ok(Err(err)) => Err(err.message),
             Err(_) => Err("client read_text_file response dropped".to_string()),
         }
     }
@@ -331,7 +331,7 @@ impl FsBridgeInner {
 
         match rx.await {
             Ok(Ok(_)) => Ok(()),
-            Ok(Err(err)) => Err(format!("{}", err.message)),
+            Ok(Err(err)) => Err(err.message),
             Err(_) => Err("client write_text_file response dropped".to_string()),
         }
     }
