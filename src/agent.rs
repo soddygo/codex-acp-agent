@@ -131,7 +131,7 @@ impl CodexAgent {
 
     fn build_session_config(&self, session_id: &str) -> Result<CodexConfig, Error> {
         let mut session_config = self.config.clone();
-        let fs_guidance = "For workspace file I/O, use the acp_fs MCP tools.\nFollow this workflow:\n1. Call read_text_file to capture the current content (and a hash if helpful).\n2. Plan edits locally instead of mutating files via shell commands.\n3. Apply replacements with edit_text_file (or multi_edit_text_file for multiple sequential edits); these now write through the bridge immediately and return the unified diff.\n4. Use write_text_file only when sending a full file replacement.";
+        let fs_guidance = "For workspace file I/O, use the acp_fs MCP tools.\nFollow this workflow:\n1. Call read_text_file once to capture the current content (reuse that snapshot unless the file changed). Use the optional line/limit parameters only when you truly need a slice.\n2. Plan edits locally instead of mutating files via shell commands.\n3. Apply replacements with edit_text_file (or multi_edit_text_file for multiple sequential edits); these now write through the bridge immediately and return the unified diff.\n4. Use write_text_file only when sending a full file replacement.\n\nAvoid issuing redundant read_text_file calls; rely on the content you already loaded unless an external process has modified the file.\nKeep all planning, tool selection, and step-by-step reasoning inside <thinking> blocks so only final answers appear outside them.";
 
         if let Some(mut base) = session_config.base_instructions.take() {
             if !base.contains("acp_fs") {
