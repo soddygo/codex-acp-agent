@@ -210,10 +210,20 @@ async fn handle_tool_call(
                 None,
             )
             .await?;
-            let snippet =
+            let mut snippet =
                 prepare_read_snippet(&response, start_line, requested_limit, MAX_READ_BYTES);
+
+            if let Some(hint) =
+                build_file_read_hint(&snippet, start_line, requested_limit, MAX_READ_BYTES)
+            {
+                if !snippet.text.is_empty() {
+                    snippet.text.push_str("\n\n");
+                }
+                snippet.text.push_str(&hint);
+            }
+
             let ReadSnippet {
-                mut text,
+                text,
                 lines_returned,
                 end_line,
                 truncated_by_line_limit,
@@ -221,22 +231,6 @@ async fn handle_tool_call(
                 additional_lines_available,
                 bytes_returned,
             } = snippet;
-
-            if let Some(hint) = build_file_read_hint(
-                lines_returned,
-                end_line,
-                start_line,
-                requested_limit,
-                truncated_by_line_limit,
-                truncated_by_bytes,
-                additional_lines_available,
-                MAX_READ_BYTES,
-            ) {
-                if !text.is_empty() {
-                    text.push_str("\n\n");
-                }
-                text.push_str(&hint);
-            }
 
             let truncated =
                 truncated_by_line_limit || truncated_by_bytes || additional_lines_available;
@@ -252,15 +246,11 @@ async fn handle_tool_call(
                 "truncated_by_bytes": truncated_by_bytes,
                 "additional_lines_available": additional_lines_available,
             });
-            if truncated {
-                if let Some(obj) = meta.as_object_mut() {
-                    obj.insert("next_line".to_string(), json!(end_line.saturating_add(1)));
-                }
+            if truncated && let Some(obj) = meta.as_object_mut() {
+                obj.insert("next_line".to_string(), json!(end_line.saturating_add(1)));
             }
-            if truncated_by_bytes {
-                if let Some(obj) = meta.as_object_mut() {
-                    obj.insert("max_bytes".to_string(), json!(MAX_READ_BYTES));
-                }
+            if truncated_by_bytes && let Some(obj) = meta.as_object_mut() {
+                obj.insert("max_bytes".to_string(), json!(MAX_READ_BYTES));
             }
 
             Ok(json!({
@@ -558,7 +548,7 @@ fn prepare_read_snippet(
             break;
         }
 
-        let segment_bytes = segment.as_bytes().len();
+        let segment_bytes = segment.len();
         if bytes_used + segment_bytes > max_bytes {
             let remaining = max_bytes.saturating_sub(bytes_used);
             if remaining > 0 {
@@ -614,34 +604,33 @@ fn truncate_to_char_boundary(segment: &str, max_bytes: usize) -> usize {
 }
 
 fn build_file_read_hint(
-    lines_returned: u32,
-    end_line: u32,
+    snippet: &ReadSnippet,
     start_line: u32,
     requested_limit: u32,
-    truncated_by_line_limit: bool,
-    truncated_by_bytes: bool,
-    additional_lines_available: bool,
     max_bytes: usize,
 ) -> Option<String> {
-    if !(truncated_by_line_limit || truncated_by_bytes || additional_lines_available) {
+    if !(snippet.truncated_by_line_limit
+        || snippet.truncated_by_bytes
+        || snippet.additional_lines_available)
+    {
         return None;
     }
 
-    let effective_end = if lines_returned == 0 {
+    let effective_end = if snippet.lines_returned == 0 {
         start_line
     } else {
-        end_line
+        snippet.end_line
     };
     let mut description = format!("Read lines {}-{}", start_line, effective_end);
 
-    if truncated_by_bytes {
+    if snippet.truncated_by_bytes {
         description.push_str(&format!(" (hit {} byte cap)", max_bytes));
-    } else if truncated_by_line_limit || additional_lines_available {
+    } else if snippet.truncated_by_line_limit || snippet.additional_lines_available {
         description.push_str(&format!(" (showing up to {} lines)", requested_limit));
     }
 
     let mut hint = format!("<file-read-info>{}", description);
-    let next_line = end_line.saturating_add(1).max(start_line);
+    let next_line = snippet.end_line.saturating_add(1).max(start_line);
     hint.push_str(&format!(
         " Continue with line={} limit={}.",
         next_line, requested_limit
@@ -662,15 +651,11 @@ fn parse_diff_line_ranges(diff_text: &str) -> (Vec<LineRange>, Vec<LineRange>) {
         let Some((body, _)) = stripped.split_once("@@") else {
             continue;
         };
-        for token in body.trim().split_whitespace() {
-            if let Some(rest) = token.strip_prefix('+') {
-                if let Some(range) = parse_range_token(rest) {
-                    new_ranges.push(range);
-                }
-            } else if let Some(rest) = token.strip_prefix('-') {
-                if let Some(range) = parse_range_token(rest) {
-                    old_ranges.push(range);
-                }
+        for token in body.split_whitespace() {
+            if let Some(range) = token.strip_prefix('+').and_then(parse_range_token) {
+                new_ranges.push(range);
+            } else if let Some(range) = token.strip_prefix('-').and_then(parse_range_token) {
+                old_ranges.push(range);
             }
         }
     }
@@ -687,8 +672,7 @@ fn parse_range_token(token: &str) -> Option<LineRange> {
     let start = parts.next()?.parse::<i64>().ok()?;
     let count = parts
         .next()
-        .map(|value| value.parse::<i64>().ok())
-        .flatten()
+        .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(1);
 
     if count <= 0 {
