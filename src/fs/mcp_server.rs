@@ -374,7 +374,6 @@ async fn stage_edits(
 
     staged_edits.stage(path.to_string(), write_content);
 
-
     Ok(json!({
         "content": [{
             "type": "text",
