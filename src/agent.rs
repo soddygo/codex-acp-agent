@@ -454,8 +454,8 @@ impl Agent for CodexAgent {
 Follow this workflow:
 1. Call read_text_file to capture the current content (and a hash if helpful).
 2. Plan edits locally instead of mutating files via shell commands.
-3. Stage replacements with edit_text_file (or multi_edit_text_file for multiple sequential edits) so the bridge can validate them and surface unified diffs.
-4. Call write_text_file once to persist the staged content. If the client rejects because the file changed, read again to refresh your view and restage.";
+3. Apply replacements with edit_text_file (or multi_edit_text_file for multiple sequential edits); these now write through the bridge immediately and return the unified diff.
+4. Use write_text_file only when sending a full file replacement.";
 
         if let Some(mut base) = session_config.base_instructions.take() {
             if !base.contains("acp_fs") {

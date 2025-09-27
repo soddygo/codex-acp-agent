@@ -31,10 +31,6 @@ impl StagedEdits {
     fn get(&self, path: &str) -> Option<&StagedFile> {
         self.entries.get(path)
     }
-
-    fn take(&mut self, path: &str) -> Option<StagedFile> {
-        self.entries.remove(path)
-    }
 }
 
 pub async fn run() -> Result<()> {
@@ -200,10 +196,10 @@ async fn handle_tool_call(
             let mut final_content = content;
             let mut staged_applied = false;
             if let Some(entry) = staged_edits
-                .take(&path)
+                .get(&path)
                 .filter(|entry| final_content.is_empty() || final_content == entry.content)
             {
-                final_content = entry.content;
+                final_content = entry.content.clone();
                 staged_applied = true;
             }
 
@@ -214,9 +210,11 @@ async fn handle_tool_call(
                 &path,
                 None,
                 None,
-                Some(final_content),
+                Some(final_content.clone()),
             )
             .await?;
+
+            staged_edits.stage(path.clone(), final_content);
 
             let response_text = if staged_applied {
                 "write completed (applied staged edits)"
@@ -361,12 +359,26 @@ async fn stage_edits(
     }
 
     let diff_text = format_diff_for_path(path, &base_content, &new_content);
-    staged_edits.stage(path.to_string(), new_content.clone());
+
+    let write_content = new_content.clone();
+    let _ = perform_bridge_request(
+        bridge_addr,
+        session_id,
+        bridge::BridgeOp::Write,
+        path,
+        None,
+        None,
+        Some(write_content.clone()),
+    )
+    .await?;
+
+    staged_edits.stage(path.to_string(), write_content);
+
 
     Ok(json!({
         "content": [{
             "type": "text",
-            "text": format!("{diff_text}\n\nStaged edits ready. Call write_text_file with path {path} to commit.")
+            "text": format!("{diff_text}\n\nWrite completed for {path}.")
         }]
     }))
 }
@@ -506,7 +518,7 @@ fn read_tool_definition() -> serde_json::Value {
 fn write_tool_definition() -> serde_json::Value {
     json!({
         "name": "write_text_file",
-        "description": "Write workspace files via ACP bridge. After staging, call this once to persist edits.",
+        "description": "Write workspace files via ACP bridge.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -522,7 +534,7 @@ fn write_tool_definition() -> serde_json::Value {
 fn edit_tool_definition() -> serde_json::Value {
     json!({
         "name": "edit_text_file",
-        "description": "Stage a focused replacement in a file before finalizing with write_text_file.",
+        "description": "Apply a focused replacement in a file and persist the result.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -539,7 +551,7 @@ fn edit_tool_definition() -> serde_json::Value {
 fn multi_edit_tool_definition() -> serde_json::Value {
     json!({
         "name": "multi_edit_text_file",
-        "description": "Stage multiple sequential replacements in a file before finalizing with write_text_file.",
+        "description": "Apply multiple sequential replacements in a file and persist the result.",
         "inputSchema": {
             "type": "object",
             "properties": {
