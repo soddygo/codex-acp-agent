@@ -24,7 +24,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.89.0
+          toolchain: 1.90.0
           components: rustfmt, clippy
 
       - name: Cache cargo
@@ -97,4 +97,3 @@ jobs:
             dist/**/**
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-

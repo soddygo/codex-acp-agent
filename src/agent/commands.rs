@@ -5,8 +5,11 @@ use codex_core::{
     protocol::{AskForApproval, Op, ReviewRequest, SandboxPolicy},
 };
 use codex_protocol::config_types::ReasoningEffort;
+use std::sync::LazyLock;
 use std::{fs, io};
 use tokio::sync::oneshot;
+
+pub static AVAILABLE_COMMANDS: LazyLock<Vec<AvailableCommand>> = LazyLock::new(built_in_commands);
 
 impl CodexAgent {
     pub async fn handle_slash_command(
@@ -25,16 +28,31 @@ impl CodexAgent {
         match name {
             "new" => {
                 // Start a new conversation within the current session
-                let (conversation_id, conversation_opt, _session_configured) = match self
+                let session_config = match self.build_session_config(&sid_str) {
+                    Ok(cfg) => cfg,
+                    Err(_err) => {
+                        let (tx, rx) = oneshot::channel();
+                        self.send_message_chunk(
+                            session_id,
+                            "Failed to prepare new conversation".into(),
+                            tx,
+                        )?;
+                        rx.await.map_err(Error::into_internal_error)?;
+                        return Ok(true);
+                    }
+                };
+
+                let convo_result = self
                     .conversation_manager
-                    .new_conversation(self.config.clone())
-                    .await
-                {
+                    .new_conversation(session_config)
+                    .await;
+
+                let (conversation, session_configured) = match convo_result {
                     Ok(NewConversation {
-                        conversation_id,
                         conversation,
                         session_configured,
-                    }) => (conversation_id, Some(conversation), session_configured),
+                        ..
+                    }) => (conversation, session_configured),
                     Err(e) => {
                         let (tx, rx) = oneshot::channel();
                         self.send_message_chunk(
@@ -47,10 +65,15 @@ impl CodexAgent {
                     }
                 };
 
-                // Update the session with the new conversation
-                session.conversation_id = conversation_id.to_string();
-                session.conversation = conversation_opt;
-                self.sessions.borrow_mut().insert(sid_str, session);
+                session.conversation_id = session_configured.session_id.to_string();
+                session.conversation = Some(conversation.clone());
+                session.current_approval = self.config.approval_policy;
+                session.current_sandbox = self.config.sandbox_policy.clone();
+                if let Some(modes) = Self::modes(&self.config) {
+                    session.current_mode = modes.current_mode_id;
+                }
+
+                self.sessions.borrow_mut().insert(sid_str.clone(), session);
 
                 let (tx, rx) = oneshot::channel();
                 self.send_message_chunk(session_id, "✨ Started a new conversation".into(), tx)?;
@@ -177,15 +200,28 @@ Notes for Agents
                     summary: None,
                 };
 
-                if let Some(conv) = session.conversation.as_ref() {
-                    conv.submit(op).await.map_err(Error::into_internal_error)?;
-                } else {
-                    let msg = "/model not available without Codex backend";
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(session_id, msg.into(), tx)?;
-                    rx.await.map_err(Error::into_internal_error)?;
-                    return Ok(true);
-                }
+                let conversation = match self.get_conversation(session_id).await {
+                    Ok(conv) => conv,
+                    Err(_) => {
+                        let msg = "/model not available without Codex backend";
+                        let (tx, rx) = oneshot::channel();
+                        self.send_message_chunk(session_id, msg.into(), tx)?;
+                        rx.await.map_err(Error::into_internal_error)?;
+                        return Ok(true);
+                    }
+                };
+
+                conversation
+                    .submit(op)
+                    .await
+                    .map_err(Error::into_internal_error)?;
+
+                self.sessions
+                    .borrow_mut()
+                    .entry(sid_str.clone())
+                    .and_modify(|state| {
+                        state.conversation = Some(conversation.clone());
+                    });
 
                 // Provide immediate feedback to the user.
                 let (tx, rx) = oneshot::channel();
@@ -215,51 +251,55 @@ Notes for Agents
                 };
 
                 return if let Some(policy) = parsed {
-                    if let Some(conv) = session.conversation.as_ref() {
-                        let submit_result = conv
-                            .submit(Op::OverrideTurnContext {
-                                cwd: None,
-                                approval_policy: Some(policy),
-                                sandbox_policy: None,
-                                model: None,
-                                effort: None,
-                                summary: None,
-                            })
-                            .await;
-
-                        if let Err(e) = submit_result {
+                    let conversation = match self.get_conversation(session_id).await {
+                        Ok(conv) => conv,
+                        Err(_) => {
+                            let msg =
+                                "⚠️ Unable to set approval policy: Codex backend not connected.";
                             let (tx, rx) = oneshot::channel();
-                            self.send_message_chunk(
-                                session_id,
-                                format!("❌ Failed to set approval policy: {}", e).into(),
-                                tx,
-                            )?;
+                            self.send_message_chunk(session_id, msg.into(), tx)?;
                             rx.await.map_err(Error::into_internal_error)?;
                             return Ok(true);
                         }
+                    };
 
-                        // Persist our local view of the policy for /status
-                        if let Ok(mut map) = self.sessions.try_borrow_mut()
-                            && let Some(state) = map.get_mut(&sid_str)
-                        {
-                            state.current_approval = policy;
-                        }
+                    let submit_result = conversation
+                        .submit(Op::OverrideTurnContext {
+                            cwd: None,
+                            approval_policy: Some(policy),
+                            sandbox_policy: None,
+                            model: None,
+                            effort: None,
+                            summary: None,
+                        })
+                        .await;
 
-                        let msg = format!(
-                            "✅ Approval policy updated to: `{}`. Use `/status` to view current session settings.",
-                            value
-                        );
+                    if let Err(e) = submit_result {
                         let (tx, rx) = oneshot::channel();
-                        self.send_message_chunk(session_id, msg.into(), tx)?;
+                        self.send_message_chunk(
+                            session_id,
+                            format!("❌ Failed to set approval policy: {}", e).into(),
+                            tx,
+                        )?;
                         rx.await.map_err(Error::into_internal_error)?;
-                        Ok(true)
-                    } else {
-                        let msg = "⚠️ Unable to set approval policy: Codex backend not connected.";
-                        let (tx, rx) = oneshot::channel();
-                        self.send_message_chunk(session_id, msg.into(), tx)?;
-                        rx.await.map_err(Error::into_internal_error)?;
-                        Ok(true)
+                        return Ok(true);
                     }
+
+                    if let Ok(mut map) = self.sessions.try_borrow_mut()
+                        && let Some(state) = map.get_mut(&sid_str)
+                    {
+                        state.current_approval = policy;
+                        state.conversation = Some(conversation.clone());
+                    }
+
+                    let msg = format!(
+                        "✅ Approval policy updated to: `{}`. Use `/status` to view current session settings.",
+                        value
+                    );
+                    let (tx, rx) = oneshot::channel();
+                    self.send_message_chunk(session_id, msg.into(), tx)?;
+                    rx.await.map_err(Error::into_internal_error)?;
+                    Ok(true)
                 } else {
                     // show current (best-effort from config)
                     let msg = "Current approval policy: configured per session. Use /approvals <policy> to set.";
@@ -316,75 +356,93 @@ Notes for Agents
         };
 
         if let Some(op) = op {
-            if let Some(conv) = session.conversation.as_ref() {
-                let submit_result = conv.submit(op).await;
-                if let Err(e) = submit_result {
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(
-                        session_id,
-                        format!("Failed to submit message: {}", e).into(),
-                        tx,
-                    )?;
-                    rx.await.map_err(Error::into_internal_error)?;
-                    return Ok(true);
-                }
+            let conversation = match session.conversation.clone() {
+                Some(conv) => conv,
+                None => match self.get_conversation(session_id).await {
+                    Ok(conv) => conv,
+                    Err(_) => {
+                        let msg = "⚠️ Unable to contact Codex backend.";
+                        let (tx, rx) = oneshot::channel();
+                        self.send_message_chunk(session_id, msg.into(), tx)?;
+                        rx.await.map_err(Error::into_internal_error)?;
+                        return Ok(true);
+                    }
+                },
+            };
 
+            let submit_result = conversation.submit(op).await;
+            if let Err(e) = submit_result {
                 let (tx, rx) = oneshot::channel();
-                self.send_message_chunk(session_id, msg.into(), tx)?;
+                self.send_message_chunk(
+                    session_id,
+                    format!("Failed to submit message: {}", e).into(),
+                    tx,
+                )?;
                 rx.await.map_err(Error::into_internal_error)?;
+                return Ok(true);
+            }
 
-                loop {
-                    let event = conv
-                        .next_event()
-                        .await
-                        .map_err(Error::into_internal_error)?;
+            if let Ok(mut map) = self.sessions.try_borrow_mut()
+                && let Some(state) = map.get_mut(&sid_str)
+            {
+                state.conversation = Some(conversation.clone());
+            }
 
-                    match event.msg {
-                        EventMsg::TaskStarted(_) => {
-                            let (tx, rx) = oneshot::channel();
-                            self.send_message_chunk(session_id, "Task started...\n\n".into(), tx)?;
-                            rx.await.map_err(Error::into_internal_error)?;
+            let (tx, rx) = oneshot::channel();
+            self.send_message_chunk(session_id, msg.into(), tx)?;
+            rx.await.map_err(Error::into_internal_error)?;
+
+            loop {
+                let event = conversation
+                    .next_event()
+                    .await
+                    .map_err(Error::into_internal_error)?;
+
+                match event.msg {
+                    EventMsg::TaskStarted(_) => {
+                        let (tx, rx) = oneshot::channel();
+                        self.send_message_chunk(session_id, "Task started...\n\n".into(), tx)?;
+                        rx.await.map_err(Error::into_internal_error)?;
+                    }
+                    EventMsg::EnteredReviewMode(_) => {
+                        let (tx, rx) = oneshot::channel();
+                        self.send_message_chunk(session_id, "Entered review mode".into(), tx)?;
+                        rx.await.map_err(Error::into_internal_error)?;
+                    }
+                    EventMsg::ExitedReviewMode(e) => {
+                        let (tx, rx) = oneshot::channel();
+                        self.send_message_chunk(session_id, "Exited review mode".into(), tx)?;
+                        rx.await.map_err(Error::into_internal_error)?;
+                        if let Some(review_output) = e.review_output {
+                            // TODO: Implement sending review output to the user
+                            info!(?review_output, "Exited review mode");
                         }
-                        EventMsg::EnteredReviewMode(_) => {
-                            let (tx, rx) = oneshot::channel();
-                            self.send_message_chunk(session_id, "Entered review mode".into(), tx)?;
-                            rx.await.map_err(Error::into_internal_error)?;
-                        }
-                        EventMsg::ExitedReviewMode(e) => {
-                            let (tx, rx) = oneshot::channel();
-                            self.send_message_chunk(session_id, "Exited review mode".into(), tx)?;
-                            rx.await.map_err(Error::into_internal_error)?;
-                            if let Some(review_output) = e.review_output {
-                                // TODO: Implement sending review output to the user
-                                info!(?review_output, "Exited review mode")
-                            }
-                            break;
-                        }
-                        EventMsg::TaskComplete(_) | EventMsg::ShutdownComplete => {
-                            let (tx, rx) = oneshot::channel();
-                            self.send_message_chunk(session_id, "Task completed".into(), tx)?;
-                            rx.await.map_err(Error::into_internal_error)?;
-                            break;
-                        }
-                        EventMsg::StreamError(err) => {
-                            let (tx, rx) = oneshot::channel();
-                            let mut msg = err.message;
-                            msg.push_str("\n\n");
-                            self.send_message_chunk(session_id, msg.into(), tx)?;
-                            rx.await.map_err(Error::into_internal_error)?;
-                            continue;
-                        }
-                        EventMsg::Error(err) => {
-                            let (tx, rx) = oneshot::channel();
-                            self.send_message_chunk(session_id, err.message.into(), tx)?;
-                            rx.await.map_err(Error::into_internal_error)?;
-                            break;
-                        }
-                        other => {
-                            let (tx, rx) = oneshot::channel();
-                            self.send_message_chunk(session_id, other.to_string().into(), tx)?;
-                            rx.await.map_err(Error::into_internal_error)?;
-                        }
+                        break;
+                    }
+                    EventMsg::TaskComplete(_) | EventMsg::ShutdownComplete => {
+                        let (tx, rx) = oneshot::channel();
+                        self.send_message_chunk(session_id, "Task completed".into(), tx)?;
+                        rx.await.map_err(Error::into_internal_error)?;
+                        break;
+                    }
+                    EventMsg::StreamError(err) => {
+                        let (tx, rx) = oneshot::channel();
+                        let mut msg = err.message;
+                        msg.push_str("\n\n");
+                        self.send_message_chunk(session_id, msg.into(), tx)?;
+                        rx.await.map_err(Error::into_internal_error)?;
+                        continue;
+                    }
+                    EventMsg::Error(err) => {
+                        let (tx, rx) = oneshot::channel();
+                        self.send_message_chunk(session_id, err.message.into(), tx)?;
+                        rx.await.map_err(Error::into_internal_error)?;
+                        break;
+                    }
+                    other => {
+                        let (tx, rx) = oneshot::channel();
+                        self.send_message_chunk(session_id, other.to_string().into(), tx)?;
+                        rx.await.map_err(Error::into_internal_error)?;
                     }
                 }
             }
