@@ -11,8 +11,29 @@ use tokio::time::{Duration, timeout};
 
 use super::bridge;
 use mcp_types::MCP_SCHEMA_VERSION;
+use tracing::info;
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+const DEFAULT_READ_LINE_LIMIT: u32 = 1000;
+const MAX_READ_BYTES: usize = 50 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LineRange {
+    start: u32,
+    end: u32,
+}
+
+#[derive(Debug)]
+struct ReadSnippet {
+    text: String,
+    lines_returned: u32,
+    end_line: u32,
+    truncated_by_line_limit: bool,
+    truncated_by_bytes: bool,
+    additional_lines_available: bool,
+    bytes_returned: usize,
+}
 
 #[derive(Default)]
 struct StagedEdits {
@@ -173,21 +194,82 @@ async fn handle_tool_call(
 
     match name {
         "read_text_file" => {
-            let args: ReadTextFileArgs = serde_json::from_value(params.clone())?;
+            let ReadTextFileArgs { path, line, limit } = serde_json::from_value(params.clone())?;
+            let start_line = line.unwrap_or(1).max(1);
+            let requested_limit = limit
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_READ_LINE_LIMIT);
+            let bridge_limit = requested_limit.saturating_add(1);
             let response = perform_bridge_request(
                 bridge_addr,
                 session_id,
                 bridge::BridgeOp::Read,
-                &args.path,
-                args.line,
-                args.limit,
+                &path,
+                line,
+                Some(bridge_limit),
                 None,
             )
             .await?;
+            let snippet =
+                prepare_read_snippet(&response, start_line, requested_limit, MAX_READ_BYTES);
+            let ReadSnippet {
+                mut text,
+                lines_returned,
+                end_line,
+                truncated_by_line_limit,
+                truncated_by_bytes,
+                additional_lines_available,
+                bytes_returned,
+            } = snippet;
+
+            if let Some(hint) = build_file_read_hint(
+                lines_returned,
+                end_line,
+                start_line,
+                requested_limit,
+                truncated_by_line_limit,
+                truncated_by_bytes,
+                additional_lines_available,
+                MAX_READ_BYTES,
+            ) {
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&hint);
+            }
+
+            let truncated =
+                truncated_by_line_limit || truncated_by_bytes || additional_lines_available;
+            let mut meta = json!({
+                "path": path,
+                "start_line": start_line,
+                "end_line": end_line,
+                "lines_returned": lines_returned,
+                "line_limit": requested_limit,
+                "bytes_returned": bytes_returned,
+                "truncated": truncated,
+                "truncated_by_line_limit": truncated_by_line_limit,
+                "truncated_by_bytes": truncated_by_bytes,
+                "additional_lines_available": additional_lines_available,
+            });
+            if truncated {
+                if let Some(obj) = meta.as_object_mut() {
+                    obj.insert("next_line".to_string(), json!(end_line.saturating_add(1)));
+                }
+            }
+            if truncated_by_bytes {
+                if let Some(obj) = meta.as_object_mut() {
+                    obj.insert("max_bytes".to_string(), json!(MAX_READ_BYTES));
+                }
+            }
+
             Ok(json!({
                 "content": [{
                     "type": "text",
-                    "text": response
+                    "text": text,
+                    "_meta": {
+                        "codex_fs_read": meta
+                    }
                 }]
             }))
         }
@@ -361,6 +443,7 @@ async fn stage_edits(
     let diff_text = format_diff_for_path(path, &base_content, &new_content);
 
     let write_content = new_content.clone();
+    let staged_bytes = write_content.len();
     let _ = perform_bridge_request(
         bridge_addr,
         session_id,
@@ -373,12 +456,29 @@ async fn stage_edits(
     .await?;
 
     staged_edits.stage(path.to_string(), write_content);
+    info!(file = %path, bytes = staged_bytes, "Staged edits committed");
+
+    let (new_ranges, old_ranges) = parse_diff_line_ranges(&diff_text);
+    let diff_meta = json!({
+        "path": path,
+        "new_ranges": line_ranges_to_json(&new_ranges),
+        "old_ranges": line_ranges_to_json(&old_ranges),
+    });
 
     Ok(json!({
-        "content": [{
-            "type": "text",
-            "text": format!("{diff_text}\n\nWrite completed for {path}.")
-        }]
+        "content": [
+            {
+                "type": "text",
+                "text": diff_text,
+                "_meta": {
+                    "codex_fs_diff": diff_meta
+                }
+            },
+            {
+                "type": "text",
+                "text": format!("Write completed for {path}.")
+            }
+        ]
     }))
 }
 
@@ -426,6 +526,190 @@ fn format_diff_for_path(path: &str, before: &str, after: &str) -> String {
 fn is_missing_file_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("no such file") || lower.contains("not found")
+}
+
+fn prepare_read_snippet(
+    raw: &str,
+    start_line: u32,
+    requested_limit: u32,
+    max_bytes: usize,
+) -> ReadSnippet {
+    if raw.is_empty() || requested_limit == 0 {
+        return ReadSnippet {
+            text: String::new(),
+            lines_returned: 0,
+            end_line: start_line.saturating_sub(1),
+            truncated_by_line_limit: false,
+            truncated_by_bytes: false,
+            additional_lines_available: false,
+            bytes_returned: 0,
+        };
+    }
+
+    let mut text = String::new();
+    let mut lines_taken: u32 = 0;
+    let mut truncated_by_line_limit = false;
+    let mut truncated_by_bytes = false;
+    let mut bytes_used: usize = 0;
+
+    for segment in raw.split_inclusive('\n') {
+        if lines_taken >= requested_limit {
+            truncated_by_line_limit = true;
+            break;
+        }
+
+        let segment_bytes = segment.as_bytes().len();
+        if bytes_used + segment_bytes > max_bytes {
+            let remaining = max_bytes.saturating_sub(bytes_used);
+            if remaining > 0 {
+                let cut = truncate_to_char_boundary(segment, remaining);
+                text.push_str(&segment[..cut]);
+                bytes_used += cut;
+            }
+            truncated_by_bytes = true;
+            lines_taken += 1;
+            break;
+        }
+
+        text.push_str(segment);
+        bytes_used += segment_bytes;
+        lines_taken += 1;
+    }
+
+    let raw_line_count = if raw.is_empty() {
+        0
+    } else {
+        raw.lines().count() as u32
+    };
+
+    let additional_lines_available =
+        truncated_by_bytes || raw_line_count > lines_taken || bytes_used < raw.len();
+
+    let end_line = if lines_taken == 0 {
+        start_line.saturating_sub(1)
+    } else {
+        start_line.saturating_add(lines_taken.saturating_sub(1))
+    };
+
+    ReadSnippet {
+        text,
+        lines_returned: lines_taken,
+        end_line,
+        truncated_by_line_limit,
+        truncated_by_bytes,
+        additional_lines_available,
+        bytes_returned: bytes_used,
+    }
+}
+
+fn truncate_to_char_boundary(segment: &str, max_bytes: usize) -> usize {
+    if max_bytes >= segment.len() {
+        return segment.len();
+    }
+    let mut idx = max_bytes;
+    while idx > 0 && !segment.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn build_file_read_hint(
+    lines_returned: u32,
+    end_line: u32,
+    start_line: u32,
+    requested_limit: u32,
+    truncated_by_line_limit: bool,
+    truncated_by_bytes: bool,
+    additional_lines_available: bool,
+    max_bytes: usize,
+) -> Option<String> {
+    if !(truncated_by_line_limit || truncated_by_bytes || additional_lines_available) {
+        return None;
+    }
+
+    let effective_end = if lines_returned == 0 {
+        start_line
+    } else {
+        end_line
+    };
+    let mut description = format!("Read lines {}-{}", start_line, effective_end);
+
+    if truncated_by_bytes {
+        description.push_str(&format!(" (hit {} byte cap)", max_bytes));
+    } else if truncated_by_line_limit || additional_lines_available {
+        description.push_str(&format!(" (showing up to {} lines)", requested_limit));
+    }
+
+    let mut hint = format!("<file-read-info>{}", description);
+    let next_line = end_line.saturating_add(1).max(start_line);
+    hint.push_str(&format!(
+        " Continue with line={} limit={}.",
+        next_line, requested_limit
+    ));
+    hint.push_str("</file-read-info>");
+
+    Some(hint)
+}
+
+fn parse_diff_line_ranges(diff_text: &str) -> (Vec<LineRange>, Vec<LineRange>) {
+    let mut new_ranges = Vec::new();
+    let mut old_ranges = Vec::new();
+
+    for line in diff_text.lines() {
+        let Some(stripped) = line.strip_prefix("@@") else {
+            continue;
+        };
+        let Some((body, _)) = stripped.split_once("@@") else {
+            continue;
+        };
+        for token in body.trim().split_whitespace() {
+            if let Some(rest) = token.strip_prefix('+') {
+                if let Some(range) = parse_range_token(rest) {
+                    new_ranges.push(range);
+                }
+            } else if let Some(rest) = token.strip_prefix('-') {
+                if let Some(range) = parse_range_token(rest) {
+                    old_ranges.push(range);
+                }
+            }
+        }
+    }
+
+    (new_ranges, old_ranges)
+}
+
+fn parse_range_token(token: &str) -> Option<LineRange> {
+    if token.is_empty() {
+        return None;
+    }
+
+    let mut parts = token.split(',');
+    let start = parts.next()?.parse::<i64>().ok()?;
+    let count = parts
+        .next()
+        .map(|value| value.parse::<i64>().ok())
+        .flatten()
+        .unwrap_or(1);
+
+    if count <= 0 {
+        return None;
+    }
+
+    let start = start.max(1) as u32;
+    let end = start.saturating_add((count as u32).saturating_sub(1));
+    Some(LineRange { start, end })
+}
+
+fn line_ranges_to_json(ranges: &[LineRange]) -> Vec<serde_json::Value> {
+    ranges
+        .iter()
+        .map(|range| {
+            json!({
+                "start": range.start,
+                "end": range.end,
+            })
+        })
+        .collect()
 }
 
 async fn perform_bridge_request(
@@ -500,7 +784,7 @@ async fn write_message(
 fn read_tool_definition() -> serde_json::Value {
     json!({
         "name": "read_text_file",
-        "description": "Read workspace files via ACP bridge.",
+        "description": "Read workspace files via ACP bridge (paged to ~1000 lines/50KB; use line/limit to continue).",
         "inputSchema": {
             "type": "object",
             "properties": {
