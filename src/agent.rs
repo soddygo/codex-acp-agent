@@ -280,7 +280,7 @@ impl CodexAgent {
         }
 
         match invocation.tool.as_str() {
-            "read_text_file" | "write_text_file" => {}
+            "read_text_file" | "write_text_file" | "edit_text_file" => {}
             _ => return None,
         }
 
