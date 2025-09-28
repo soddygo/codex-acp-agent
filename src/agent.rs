@@ -495,23 +495,29 @@ impl Agent for CodexAgent {
             .await
             .map_err(Error::into_internal_error)?;
 
-        let pos = Arc::new(vec![
+        let permission_opts = Arc::new(vec![
             acp::PermissionOption {
-                id: acp::PermissionOptionId("approve_for_session".into()),
-                name: "Approve for Session".into(),
+                id: acp::PermissionOptionId("allow_always".into()),
+                name: "Allow Always".into(),
                 kind: acp::PermissionOptionKind::AllowAlways,
                 meta: None,
             },
             acp::PermissionOption {
-                id: acp::PermissionOptionId("approve".into()),
-                name: "Approve".into(),
+                id: acp::PermissionOptionId("allow_once".into()),
+                name: "Allow Once".into(),
                 kind: acp::PermissionOptionKind::AllowOnce,
                 meta: None,
             },
             acp::PermissionOption {
-                id: acp::PermissionOptionId("deny".into()),
-                name: "Deny".into(),
+                id: acp::PermissionOptionId("reject_once".into()),
+                name: "Reject Once".into(),
                 kind: acp::PermissionOptionKind::RejectOnce,
+                meta: None,
+            },
+            acp::PermissionOption {
+                id: acp::PermissionOptionId("reject_always".into()),
+                name: "Reject Always".into(),
+                kind: acp::PermissionOptionKind::RejectAlways,
                 meta: None,
             },
         ]);
@@ -750,7 +756,7 @@ impl Agent for CodexAgent {
                     let permission_req = acp::RequestPermissionRequest {
                         session_id: args.session_id.clone(),
                         tool_call: update,
-                        options: pos.as_ref().clone(),
+                        options: permission_opts.as_ref().clone(),
                         meta: None,
                     };
 
@@ -828,7 +834,7 @@ impl Agent for CodexAgent {
                     let permission_req = acp::RequestPermissionRequest {
                         session_id: args.session_id.clone(),
                         tool_call: update,
-                        options: pos.as_ref().clone(),
+                        options: permission_opts.as_ref().clone(),
                         meta: None,
                     };
                     let (txp, rxp) = oneshot::channel();
