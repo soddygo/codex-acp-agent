@@ -10,7 +10,7 @@ use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
     AuthManager, CodexConversation, ConversationManager, NewConversation,
     config::Config as CodexConfig,
-    config_types::McpServerConfig,
+    config_types::{McpServerConfig, McpServerTransportConfig},
     protocol::{
         AskForApproval, EventMsg, InputItem, McpInvocation, Op, ReviewDecision, SandboxPolicy,
         TokenUsage,
@@ -122,9 +122,11 @@ impl CodexAgent {
         env.insert("ACP_FS_SESSION_ID".to_string(), session_id.to_string());
 
         Ok(McpServerConfig {
-            command: exe_path.to_string_lossy().into_owned(),
-            args: vec!["--acp-fs-mcp".to_string()],
-            env: Some(env),
+            transport: McpServerTransportConfig::Stdio {
+                command: exe_path.to_string_lossy().into_owned(),
+                args: vec!["--acp-fs-mcp".to_string()],
+                env: Some(env),
+            },
             startup_timeout_sec: Some(Duration::from_secs(5)),
             tool_timeout_sec: Some(Duration::from_secs(30)),
         })
