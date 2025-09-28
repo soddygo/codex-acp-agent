@@ -193,24 +193,26 @@ impl CodexAgent {
         &self,
         session_id: &acp::SessionId,
     ) -> Result<Arc<CodexConversation>, Error> {
-        let maybe_state = self.sessions.borrow().get(session_id.0.as_ref()).cloned();
-
-        let state = match maybe_state {
-            Some(state) => state,
-            None => return Err(Error::invalid_params().with_data("session not found")),
+        let (conversation_opt, conversation_id_str) = {
+            let sessions = self.sessions.borrow();
+            let state = sessions
+                .get(session_id.0.as_ref())
+                .ok_or_else(|| Error::invalid_params().with_data("session not found"))?;
+            (state.conversation.clone(), state.conversation_id.clone())
         };
 
-        if let Some(conversation) = state.conversation.clone() {
+        if let Some(conversation) = conversation_opt {
             return Ok(conversation);
         }
 
-        let conversation_id = if state.conversation_id.is_empty() {
-            ConversationId::from_string(session_id.0.as_ref())
-                .map_err(|e| Error::from(anyhow::anyhow!(e)))?
+        let conversation_id_string = if conversation_id_str.is_empty() {
+            session_id.0.as_ref().to_owned()
         } else {
-            ConversationId::from_string(&state.conversation_id)
-                .map_err(|e| Error::from(anyhow::anyhow!(e)))?
+            conversation_id_str
         };
+
+        let conversation_id = ConversationId::from_string(&conversation_id_string)
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
         let conversation = self
             .conversation_manager
@@ -223,7 +225,7 @@ impl CodexAgent {
         {
             entry.conversation = Some(conversation.clone());
             if entry.conversation_id.is_empty() {
-                entry.conversation_id = session_id.0.as_ref().to_string();
+                entry.conversation_id = conversation_id_string;
             }
         }
 
