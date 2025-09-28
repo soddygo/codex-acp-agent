@@ -26,7 +26,8 @@ use crate::fs::FsBridge;
 
 mod commands;
 
-static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
+pub static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> =
+    LazyLock::new(builtin_approval_presets);
 
 // Placeholder for per-session state. Holds the Codex conversation
 // handle, its id (for status/reporting), and bookkeeping for streaming.
@@ -635,15 +636,11 @@ impl Agent for CodexAgent {
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
-        if let Some(state) = self
-            .sessions
-            .borrow_mut()
-            .get_mut(&args.session_id.0.to_string())
-        {
+        self.with_session_state_mut(&args.session_id, |state| {
             state.current_approval = preset.approval;
             state.current_sandbox = preset.sandbox.clone();
             state.current_mode = args.mode_id.clone();
-        }
+        });
 
         Ok(acp::SetSessionModeResponse::default())
     }
@@ -711,23 +708,29 @@ impl Agent for CodexAgent {
             .await
             .map_err(Error::into_internal_error)?;
 
-        let pos = Arc::new(vec![
+        let permission_opts = Arc::new(vec![
             acp::PermissionOption {
-                id: acp::PermissionOptionId("approve_for_session".into()),
-                name: "Approve for Session".into(),
+                id: acp::PermissionOptionId("allow_always".into()),
+                name: "Allow Always".into(),
                 kind: acp::PermissionOptionKind::AllowAlways,
                 meta: None,
             },
             acp::PermissionOption {
-                id: acp::PermissionOptionId("approve".into()),
-                name: "Approve".into(),
+                id: acp::PermissionOptionId("allow_once".into()),
+                name: "Allow Once".into(),
                 kind: acp::PermissionOptionKind::AllowOnce,
                 meta: None,
             },
             acp::PermissionOption {
-                id: acp::PermissionOptionId("deny".into()),
-                name: "Deny".into(),
+                id: acp::PermissionOptionId("reject_once".into()),
+                name: "Reject Once".into(),
                 kind: acp::PermissionOptionKind::RejectOnce,
+                meta: None,
+            },
+            acp::PermissionOption {
+                id: acp::PermissionOptionId("reject_always".into()),
+                name: "Reject Always".into(),
+                kind: acp::PermissionOptionKind::RejectAlways,
                 meta: None,
             },
         ]);
@@ -969,7 +972,7 @@ impl Agent for CodexAgent {
                     let permission_req = acp::RequestPermissionRequest {
                         session_id: args.session_id.clone(),
                         tool_call: update,
-                        options: pos.as_ref().clone(),
+                        options: permission_opts.as_ref().clone(),
                         meta: None,
                     };
 
@@ -1047,7 +1050,7 @@ impl Agent for CodexAgent {
                     let permission_req = acp::RequestPermissionRequest {
                         session_id: args.session_id.clone(),
                         tool_call: update,
-                        options: pos.as_ref().clone(),
+                        options: permission_opts.as_ref().clone(),
                         meta: None,
                     };
                     let (txp, rxp) = oneshot::channel();
@@ -1108,15 +1111,11 @@ impl Agent for CodexAgent {
 
     async fn cancel(&self, args: acp::CancelNotification) -> Result<(), Error> {
         info!(?args, "Received cancel request");
-        let session_id = args.session_id.0.to_string();
-        // Scope borrow to avoid RefCell issues across await
-        let conv = self.get_conversation(&args.session_id).await?;
-        // Best-effort: we don't need the submission id here.
-        conv.submit(Op::Interrupt)
+        self.get_conversation(&args.session_id)
+            .await?
+            .submit(Op::Interrupt)
             .await
             .map_err(|e| Error::from(anyhow::anyhow!("failed to send interrupt: {}", e)))?;
-        // Remove session from cache after interrupt
-        self.sessions.borrow_mut().remove(&session_id);
         Ok(())
     }
 

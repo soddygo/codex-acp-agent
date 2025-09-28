@@ -204,65 +204,66 @@ Notes for Agents
                 return Ok(true);
             }
             "approvals" => {
-                let value = _rest.trim().to_lowercase();
-                let parsed = match value.as_str() {
-                    "" | "show" => None,
-                    "on-request" => Some(AskForApproval::OnRequest),
-                    "on-failure" => Some(AskForApproval::OnFailure),
-                    "never" => Some(AskForApproval::Never),
-                    "untrusted" | "unless-trusted" => Some(AskForApproval::UnlessTrusted),
-                    _ => {
-                        let msg = "Usage: /approvals untrusted|on-request|on-failure|never";
-                        let (tx, rx) = oneshot::channel();
-                        self.send_message_chunk(session_id, msg.into(), tx)?;
-                        rx.await.map_err(Error::into_internal_error)?;
-                        return Ok(true);
-                    }
-                };
+                let mode = _rest.trim().to_lowercase();
+                let allowed = ["read-only", "auto", "full-access"];
 
-                return if let Some(policy) = parsed {
-                    let submit_result = conversation
-                        .submit(Op::OverrideTurnContext {
-                            cwd: None,
-                            approval_policy: Some(policy),
-                            sandbox_policy: None,
-                            model: None,
-                            effort: None,
-                            summary: None,
-                        })
-                        .await;
-
-                    if let Err(e) = submit_result {
-                        let (tx, rx) = oneshot::channel();
-                        self.send_message_chunk(
-                            session_id,
-                            format!("❌ Failed to set approval policy: {}", e).into(),
-                            tx,
-                        )?;
-                        rx.await.map_err(Error::into_internal_error)?;
-                        return Ok(true);
-                    }
-
-                    // Persist our local view of the policy for /status
-                    self.with_session_state_mut(session_id, |state| {
-                        state.current_approval = policy;
-                    });
-
-                    let msg = format!(
-                        "✅ Approval policy updated to: `{}`. Use `/status` to view current session settings.",
-                        value
-                    );
+                if !allowed.contains(&mode.as_str()) {
+                    let msg = format!("Usage: /approvals {}", allowed.join("|"));
                     let (tx, rx) = oneshot::channel();
                     self.send_message_chunk(session_id, msg.into(), tx)?;
                     rx.await.map_err(Error::into_internal_error)?;
-                    Ok(true)
-                } else {
-                    let msg = "⚠️ Unable to set approval policy: Codex backend not connected.";
+                    return Ok(true);
+                }
+
+                let preset = APPROVAL_PRESETS
+                    .iter()
+                    .find(|preset| mode == preset.id)
+                    .ok_or_else(Error::invalid_params)?;
+
+                let submit_result = conversation
+                    .submit(Op::OverrideTurnContext {
+                        cwd: None,
+                        approval_policy: Some(preset.approval),
+                        sandbox_policy: Some(preset.sandbox.clone()),
+                        model: None,
+                        effort: None,
+                        summary: None,
+                    })
+                    .await;
+
+                if let Err(e) = submit_result {
                     let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(session_id, msg.into(), tx)?;
+                    self.send_message_chunk(
+                        session_id,
+                        format!("⚠️ Failed to set approval policy: {}", e).into(),
+                        tx,
+                    )?;
                     rx.await.map_err(Error::into_internal_error)?;
-                    Ok(true)
-                };
+                    return Ok(true);
+                }
+
+                // Persist our local view of the policy for /status
+                self.with_session_state_mut(session_id, |state| {
+                    state.current_approval = preset.approval;
+                    state.current_sandbox = preset.sandbox.clone();
+                    state.current_mode = acp::SessionModeId(preset.id.into());
+                });
+
+                let (tx, rx) = oneshot::channel();
+                self.session_update_tx
+                    .send((
+                        acp::SessionNotification {
+                            session_id: session_id.clone(),
+                            update: acp::SessionUpdate::CurrentModeUpdate {
+                                current_mode_id: acp::SessionModeId(preset.id.into()),
+                            },
+                            meta: None,
+                        },
+                        tx,
+                    ))
+                    .map_err(Error::into_internal_error)?;
+                rx.await.map_err(Error::into_internal_error)?;
+                return Ok(true);
             }
             "quit" => {
                 // Say goodbye and submit Shutdown to Codex if available
@@ -654,7 +655,7 @@ fn built_in_commands() -> Vec<AvailableCommand> {
             name: "approvals".into(),
             description: "choose what Codex can do without approval".into(),
             input: Some(AvailableCommandInput::Unstructured {
-                hint: "untrusted|on-request|on-failure|never".into(),
+                hint: "read-only|auto|full-access".into(),
             }),
             meta: None,
         },
