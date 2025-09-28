@@ -47,12 +47,12 @@ impl CodexAgent {
                     .new_conversation(session_config)
                     .await;
 
-                let (conversation, session_configured) = match convo_result {
+                let (conversation, conversation_id) = match convo_result {
                     Ok(NewConversation {
                         conversation,
-                        session_configured,
+                        conversation_id,
                         ..
-                    }) => (conversation, session_configured),
+                    }) => (conversation, conversation_id),
                     Err(e) => {
                         let (tx, rx) = oneshot::channel();
                         self.send_message_chunk(
@@ -65,7 +65,7 @@ impl CodexAgent {
                     }
                 };
 
-                session.conversation_id = session_configured.session_id.to_string();
+                session.conversation_id = conversation_id.to_string();
                 session.conversation = Some(conversation.clone());
                 session.current_approval = self.config.approval_policy;
                 session.current_sandbox = self.config.sandbox_policy.clone();

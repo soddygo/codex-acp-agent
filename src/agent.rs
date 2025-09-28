@@ -540,11 +540,30 @@ impl Agent for CodexAgent {
             .map(|m| m.current_mode_id.clone())
             .unwrap_or(acp::SessionModeId("auto".into()));
 
+        let session_config = self.build_session_config(&session_id)?;
+
+        let new_conv = self
+            .conversation_manager
+            .new_conversation(session_config)
+            .await;
+
+        let (conversation, conversation_id) = match new_conv {
+            Ok(NewConversation {
+                conversation,
+                conversation_id,
+                ..
+            }) => (conversation, conversation_id),
+            Err(e) => {
+                warn!(error = %e, "Failed to create Codex conversation");
+                return Err(Error::into_internal_error(e));
+            }
+        };
+
         self.sessions.borrow_mut().insert(
             session_id.clone(),
             SessionState {
-                conversation_id: String::new(),
-                conversation: None,
+                conversation_id: conversation_id.to_string(),
+                conversation: Some(conversation.clone()),
                 current_approval: self.config.approval_policy,
                 current_sandbox: self.config.sandbox_policy.clone(),
                 current_mode: current_mode.clone(),
@@ -553,39 +572,6 @@ impl Agent for CodexAgent {
                 current_reasoning_chunk: String::new(),
             },
         );
-
-        let session_config = match self.build_session_config(&session_id) {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                self.sessions.borrow_mut().remove(&session_id);
-                return Err(err);
-            }
-        };
-
-        let new_conv = self
-            .conversation_manager
-            .new_conversation(session_config)
-            .await;
-
-        let (conversation, session_configured) = match new_conv {
-            Ok(NewConversation {
-                conversation,
-                session_configured,
-                ..
-            }) => (conversation, session_configured),
-            Err(e) => {
-                warn!(error = %e, "Failed to create Codex conversation");
-                self.sessions.borrow_mut().remove(&session_id);
-                return Err(Error::into_internal_error(e));
-            }
-        };
-
-        if let Ok(mut sessions) = self.sessions.try_borrow_mut()
-            && let Some(state) = sessions.get_mut(&session_id)
-        {
-            state.conversation_id = session_configured.session_id.to_string();
-            state.conversation = Some(conversation.clone());
-        }
 
         // Advertise available slash commands to the client right after
         // the session is created. Send it asynchronously to avoid racing
