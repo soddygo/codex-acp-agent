@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
         let (client_tx, mut client_rx) = mpsc::unbounded_channel();
 
         let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default())?;
-        let agent = CodexAgent::with_config(tx, client_tx.clone(), config);
+        let agent = CodexAgent::with_config(tx, client_tx, config);
         let (conn, handle_io) = AgentSideConnection::new(agent, outgoing, incoming, |fut| {
             task::spawn_local(fut);
         });

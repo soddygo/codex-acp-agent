@@ -20,7 +20,8 @@ use tracing::{info, warn};
 
 mod commands;
 
-static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
+pub static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> =
+    LazyLock::new(builtin_approval_presets);
 
 // Placeholder for per-session state. Holds the Codex conversation
 // handle, its id (for status/reporting), and bookkeeping for streaming.
@@ -422,15 +423,11 @@ impl Agent for CodexAgent {
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
-        if let Some(state) = self
-            .sessions
-            .borrow_mut()
-            .get_mut(&args.session_id.0.to_string())
-        {
+        self.with_session_state_mut(&args.session_id, |state| {
             state.current_approval = preset.approval;
             state.current_sandbox = preset.sandbox.clone();
             state.current_mode = args.mode_id.clone();
-        }
+        });
 
         Ok(acp::SetSessionModeResponse::default())
     }
@@ -892,15 +889,11 @@ impl Agent for CodexAgent {
 
     async fn cancel(&self, args: acp::CancelNotification) -> Result<(), Error> {
         info!(?args, "Received cancel request");
-        let session_id = args.session_id.0.to_string();
-        // Scope borrow to avoid RefCell issues across await
-        let conv = self.get_conversation(&args.session_id).await?;
-        // Best-effort: we don't need the submission id here.
-        conv.submit(Op::Interrupt)
+        self.get_conversation(&args.session_id)
+            .await?
+            .submit(Op::Interrupt)
             .await
             .map_err(|e| Error::from(anyhow::anyhow!("failed to send interrupt: {}", e)))?;
-        // Remove session from cache after interrupt
-        self.sessions.borrow_mut().remove(&session_id);
         Ok(())
     }
 
