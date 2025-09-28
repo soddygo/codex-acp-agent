@@ -21,6 +21,7 @@ use serde_json::json;
 use tokio::sync::{mpsc, oneshot, oneshot::Sender};
 use tokio::task;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::fs::FsBridge;
 
@@ -35,6 +36,7 @@ pub static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> =
 struct SessionState {
     // Conversation id string for display/logging purposes.
     conversation_id: String,
+    fs_session_id: String,
     conversation: Option<Arc<CodexConversation>>,
     current_approval: AskForApproval,
     current_sandbox: SandboxPolicy,
@@ -51,9 +53,14 @@ pub struct SessionModeLookup {
 
 impl SessionModeLookup {
     pub fn current_mode(&self, session_id: &acp::SessionId) -> Option<acp::SessionModeId> {
-        self.inner
-            .borrow()
-            .get(session_id.0.as_ref())
+        let sessions = self.inner.borrow();
+        if let Some(state) = sessions.get(session_id.0.as_ref()) {
+            return Some(state.current_mode.clone());
+        }
+
+        sessions
+            .values()
+            .find(|state| state.fs_session_id == session_id.0.as_ref())
             .map(|state| state.current_mode.clone())
     }
 
@@ -61,6 +68,21 @@ impl SessionModeLookup {
         self.current_mode(session_id)
             .map(|mode| mode.0.as_ref() == "read-only")
             .unwrap_or(false)
+    }
+
+    pub fn resolve_acp_session_id(&self, session_id: &acp::SessionId) -> Option<acp::SessionId> {
+        let sessions = self.inner.borrow();
+        if sessions.contains_key(session_id.0.as_ref()) {
+            return Some(session_id.clone());
+        }
+
+        sessions.iter().find_map(|(key, state)| {
+            if state.fs_session_id == session_id.0.as_ref() {
+                Some(acp::SessionId(key.clone().into()))
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -72,7 +94,6 @@ pub struct CodexAgent {
     auth_manager: Arc<RwLock<Arc<AuthManager>>>,
     client_tx: mpsc::UnboundedSender<ClientOp>,
     client_capabilities: RefCell<acp::ClientCapabilities>,
-    next_session_id: RefCell<u64>,
     fs_bridge: Option<Arc<FsBridge>>,
 }
 
@@ -94,7 +115,6 @@ impl CodexAgent {
             auth_manager: Arc::new(RwLock::new(auth)),
             client_tx,
             client_capabilities: RefCell::new(Default::default()),
-            next_session_id: RefCell::new(1),
             fs_bridge,
         }
     }
@@ -530,12 +550,7 @@ impl Agent for CodexAgent {
         args: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, Error> {
         info!(?args, "Received new session request");
-        let session_id = {
-            let mut next = self.next_session_id.borrow_mut();
-            let value = *next;
-            *next += 1;
-            value.to_string()
-        };
+        let fs_session_id = Uuid::new_v4().to_string();
 
         let modes = Self::modes(&self.config);
         let current_mode = modes
@@ -543,7 +558,7 @@ impl Agent for CodexAgent {
             .map(|m| m.current_mode_id.clone())
             .unwrap_or(acp::SessionModeId("auto".into()));
 
-        let session_config = self.build_session_config(&session_id)?;
+        let session_config = self.build_session_config(&fs_session_id)?;
 
         let new_conv = self
             .conversation_manager
@@ -562,10 +577,13 @@ impl Agent for CodexAgent {
             }
         };
 
+        let acp_session_id = conversation_id.to_string();
+
         self.sessions.borrow_mut().insert(
-            session_id.clone(),
+            acp_session_id.clone(),
             SessionState {
-                conversation_id: conversation_id.to_string(),
+                fs_session_id: fs_session_id.clone(),
+                conversation_id: acp_session_id.clone(),
                 conversation: Some(conversation.clone()),
                 current_approval: self.config.approval_policy,
                 current_sandbox: self.config.sandbox_policy.clone(),
@@ -580,7 +598,7 @@ impl Agent for CodexAgent {
         // the session is created. Send it asynchronously to avoid racing
         // with the NewSessionResponse delivery.
         {
-            let session_id = session_id.clone();
+            let session_id = acp_session_id.clone();
             let available_commands = commands::AVAILABLE_COMMANDS.to_vec();
             let tx_updates = self.session_update_tx.clone();
             task::spawn_local(async move {
@@ -598,7 +616,7 @@ impl Agent for CodexAgent {
         }
 
         Ok(acp::NewSessionResponse {
-            session_id: acp::SessionId(session_id.into()),
+            session_id: acp::SessionId(acp_session_id.clone().into()),
             modes,
             meta: None,
         })

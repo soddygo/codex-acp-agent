@@ -48,10 +48,18 @@ impl CodexAgent {
                     .map(|m| m.current_mode_id.clone())
                     .unwrap_or(acp::SessionModeId("auto".into()));
 
+                let fs_session_id = self
+                    .sessions
+                    .borrow()
+                    .get(session_id.0.as_ref())
+                    .map(|state| state.fs_session_id.clone())
+                    .unwrap_or_else(|| session_id.0.as_ref().to_string());
+
                 // Update the session with the new conversation
                 self.sessions.borrow_mut().insert(
                     session_id.0.as_ref().to_string(),
                     SessionState {
+                        fs_session_id,
                         conversation_id: conversation_id.to_string(),
                         conversation: None,
                         current_approval: self.config.approval_policy,

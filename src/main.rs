@@ -59,18 +59,38 @@ async fn main() -> Result<()> {
                                 let res = conn.request_permission(req).await;
                                 let _ = tx.send(res);
                             }
-                            Some(agent::ClientOp::ReadTextFile(req, tx)) => {
-                                let res = conn.read_text_file(req).await;
-                                let _ = tx.send(res);
+                            Some(agent::ClientOp::ReadTextFile(mut req, tx)) => {
+                                match session_modes.resolve_acp_session_id(&req.session_id) {
+                                    Some(resolved_id) => {
+                                        req.session_id = resolved_id;
+                                        let res = conn.read_text_file(req).await;
+                                        let _ = tx.send(res);
+                                    }
+                                    None => {
+                                        let err = Error::invalid_params()
+                                            .with_data("unknown session for read_text_file");
+                                        let _ = tx.send(Err(err));
+                                    }
+                                }
                             }
-                            Some(agent::ClientOp::WriteTextFile(req, tx)) => {
-                                if session_modes.is_read_only(&req.session_id) {
-                                    let err = Error::invalid_params()
-                                        .with_data("write_text_file is disabled while session mode is read-only");
-                                    let _ = tx.send(Err(err));
-                                } else {
-                                    let res = conn.write_text_file(req).await;
-                                    let _ = tx.send(res);
+                            Some(agent::ClientOp::WriteTextFile(mut req, tx)) => {
+                                match session_modes.resolve_acp_session_id(&req.session_id) {
+                                    Some(resolved_id) => {
+                                        req.session_id = resolved_id.clone();
+                                        if session_modes.is_read_only(&resolved_id) {
+                                            let err = Error::invalid_params()
+                                                .with_data("write_text_file is disabled while session mode is read-only");
+                                            let _ = tx.send(Err(err));
+                                        } else {
+                                            let res = conn.write_text_file(req).await;
+                                            let _ = tx.send(res);
+                                        }
+                                    }
+                                    None => {
+                                        let err = Error::invalid_params()
+                                            .with_data("unknown session for write_text_file");
+                                        let _ = tx.send(Err(err));
+                                    }
                                 }
                             }
                             None => break,
