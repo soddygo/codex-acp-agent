@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
 
         let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default())?;
         let fs_bridge = fs::FsBridge::start(client_tx.clone(), config.cwd.clone()).await?;
-        let agent = CodexAgent::with_config(tx, client_tx.clone(), config, Some(fs_bridge));
+        let agent = CodexAgent::with_config(tx, client_tx, config, Some(fs_bridge));
         let session_modes = agent.session_mode_lookup();
         let (conn, handle_io) = AgentSideConnection::new(agent, outgoing, incoming, |fut| {
             task::spawn_local(fut);
