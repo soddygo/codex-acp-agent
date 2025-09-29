@@ -3,7 +3,7 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.90%2B-blue.svg)](rust-toolchain.toml)
 [![Edition](https://img.shields.io/badge/Edition-2024-blueviolet.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
 
-> This repository is implemented by the `codex` agent.
+> Most of this repository code is implemented and reviewed by `codex` agents.
 
 An Agent Client Protocol (ACP)–compatible agent that bridges the OpenAI Codex runtime with ACP clients over stdio. This project is under active development — features are evolving and breaking changes are likely.
 
@@ -101,13 +101,13 @@ When a session starts, `codex-acp` spins up an in-process TCP bridge and registe
 
 - Slash commands (advertised via `AvailableCommandsUpdate`)
   - Implemented today:
+    - `/new` — Start a new chat during a conversation.
     - `/init` - Create an AGENTS.md file with instructions for Codex
     - `/model` — Show or set the current model (uses `Op::OverrideTurnContext`).
-    - `/approvals` — Set approval mode (`untrusted | on-request | on-failure | never`).
+    - `/approvals` — Set approval mode (`ready-only | auto | full-access`).
     - `/status` — Rich status (workspace, account, model, token usage).
     - `/compact` — Summarize conversation to prevent hitting the context limit.
     - `/review` — Review current changes and find issues.
-    - `/new` — Start a new chat during a conversation.
     - `/quit` — Exit Codex agent. Shows a goodbye message and requests backend shutdown if available.
 
 - Session modes
