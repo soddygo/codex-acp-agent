@@ -1,15 +1,19 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock, RwLock};
+use std::time::Duration;
 
 use agent_client_protocol::{self as acp, Agent, Error, V1};
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
     AuthManager, CodexConversation, ConversationManager, NewConversation,
     config::Config as CodexConfig,
+    config_types::{McpServerConfig, McpServerTransportConfig},
     protocol::{
-        AskForApproval, EventMsg, InputItem, Op, ReviewDecision, SandboxPolicy, TokenUsage,
+        AskForApproval, EventMsg, InputItem, McpInvocation, Op, ReviewDecision, SandboxPolicy,
+        TokenUsage,
     },
 };
 use codex_protocol::mcp_protocol::{AuthMode, ConversationId};
@@ -17,6 +21,9 @@ use serde_json::json;
 use tokio::sync::{mpsc, oneshot, oneshot::Sender};
 use tokio::task;
 use tracing::{info, warn};
+use uuid::Uuid;
+
+use crate::fs::FsBridge;
 
 mod commands;
 
@@ -28,12 +35,55 @@ pub static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> =
 #[derive(Clone)]
 struct SessionState {
     // Conversation id string for display/logging purposes.
+    conversation_id: String,
+    fs_session_id: String,
+    conversation: Option<Arc<CodexConversation>>,
     current_approval: AskForApproval,
     current_sandbox: SandboxPolicy,
     current_mode: acp::SessionModeId,
     token_usage: Option<TokenUsage>,
     reasoning_sections: Vec<String>,
     current_reasoning_chunk: String,
+}
+
+#[derive(Clone)]
+pub struct SessionModeLookup {
+    inner: Rc<RefCell<HashMap<String, SessionState>>>,
+}
+
+impl SessionModeLookup {
+    pub fn current_mode(&self, session_id: &acp::SessionId) -> Option<acp::SessionModeId> {
+        let sessions = self.inner.borrow();
+        if let Some(state) = sessions.get(session_id.0.as_ref()) {
+            return Some(state.current_mode.clone());
+        }
+
+        sessions
+            .values()
+            .find(|state| state.fs_session_id == session_id.0.as_ref())
+            .map(|state| state.current_mode.clone())
+    }
+
+    pub fn is_read_only(&self, session_id: &acp::SessionId) -> bool {
+        self.current_mode(session_id)
+            .map(|mode| mode.0.as_ref() == "read-only")
+            .unwrap_or(false)
+    }
+
+    pub fn resolve_acp_session_id(&self, session_id: &acp::SessionId) -> Option<acp::SessionId> {
+        let sessions = self.inner.borrow();
+        if sessions.contains_key(session_id.0.as_ref()) {
+            return Some(session_id.clone());
+        }
+
+        sessions.iter().find_map(|(key, state)| {
+            if state.fs_session_id == session_id.0.as_ref() {
+                Some(acp::SessionId(key.clone().into()))
+            } else {
+                None
+            }
+        })
+    }
 }
 
 pub struct CodexAgent {
@@ -44,6 +94,7 @@ pub struct CodexAgent {
     auth_manager: Arc<RwLock<Arc<AuthManager>>>,
     client_tx: mpsc::UnboundedSender<ClientOp>,
     client_capabilities: RefCell<acp::ClientCapabilities>,
+    fs_bridge: Option<Arc<FsBridge>>,
 }
 
 impl CodexAgent {
@@ -51,6 +102,7 @@ impl CodexAgent {
         session_update_tx: mpsc::UnboundedSender<(acp::SessionNotification, Sender<()>)>,
         client_tx: mpsc::UnboundedSender<ClientOp>,
         config: CodexConfig,
+        fs_bridge: Option<Arc<FsBridge>>,
     ) -> Self {
         let auth = AuthManager::shared(config.codex_home.clone());
         let conversation_manager = ConversationManager::new(auth.clone());
@@ -63,7 +115,78 @@ impl CodexAgent {
             auth_manager: Arc::new(RwLock::new(auth)),
             client_tx,
             client_capabilities: RefCell::new(Default::default()),
+            fs_bridge,
         }
+    }
+
+    pub fn session_mode_lookup(&self) -> SessionModeLookup {
+        SessionModeLookup {
+            inner: self.sessions.clone(),
+        }
+    }
+
+    fn prepare_fs_mcp_server_config(
+        &self,
+        session_id: &str,
+        bridge: &FsBridge,
+    ) -> Result<McpServerConfig, Error> {
+        let exe_path = std::env::current_exe().map_err(|err| {
+            Error::internal_error().with_data(format!("failed to locate agent binary: {err}"))
+        })?;
+
+        let mut env = HashMap::new();
+        env.insert(
+            "ACP_FS_BRIDGE_ADDR".to_string(),
+            bridge.address().to_string(),
+        );
+        env.insert("ACP_FS_SESSION_ID".to_string(), session_id.to_string());
+
+        Ok(McpServerConfig {
+            transport: McpServerTransportConfig::Stdio {
+                command: exe_path.to_string_lossy().into_owned(),
+                args: vec!["--acp-fs-mcp".to_string()],
+                env: Some(env),
+            },
+            startup_timeout_sec: Some(Duration::from_secs(5)),
+            tool_timeout_sec: Some(Duration::from_secs(30)),
+        })
+    }
+
+    fn build_session_config(&self, session_id: &str) -> Result<CodexConfig, Error> {
+        let mut session_config = self.config.clone();
+        let fs_guidance = "For workspace file I/O, use the acp_fs MCP tools.\nFollow this workflow:\n1. Call read_text_file once to capture the current content. Results are paged (≈1000 lines / 50KB) and include a <file-read-info> hint when more remains—follow it with the line/limit parameters instead of re-reading from the top, and reuse that snapshot unless the file actually changed.\n2. Plan edits locally instead of mutating files via shell commands.\n3. Apply replacements with edit_text_file (or multi_edit_text_file for multiple sequential edits); these now write through the bridge immediately and return the unified diff with line metadata.\n4. Use write_text_file only when sending a full file replacement.\n\nAvoid issuing redundant read_text_file calls; rely on the content you already loaded unless an external process has modified the file.\nKeep all planning, tool selection, and step-by-step reasoning inside <thinking> blocks (statements like “I'll apply a focused edit…” belong there) so only final answers appear outside them.";
+
+        if let Some(mut base) = session_config.base_instructions.take() {
+            if !base.contains("acp_fs") {
+                if !base.trim_end().is_empty() {
+                    base.push_str("\n\n");
+                }
+                base.push_str(fs_guidance);
+            }
+            session_config.base_instructions = Some(base);
+        } else {
+            session_config.user_instructions = match session_config.user_instructions.take() {
+                Some(mut existing) => {
+                    if !existing.contains("acp_fs") {
+                        if !existing.trim_end().is_empty() {
+                            existing.push_str("\n\n");
+                        }
+                        existing.push_str(fs_guidance);
+                    }
+                    Some(existing)
+                }
+                None => Some(fs_guidance.to_string()),
+            };
+        }
+
+        if let Some(bridge) = &self.fs_bridge {
+            let server_config = self.prepare_fs_mcp_server_config(session_id, bridge.as_ref())?;
+            session_config
+                .mcp_servers
+                .insert("acp_fs".to_string(), server_config);
+        }
+
+        Ok(session_config)
     }
 
     fn modes(config: &CodexConfig) -> Option<acp::SessionModeState> {
@@ -93,22 +216,43 @@ impl CodexAgent {
         &self,
         session_id: &acp::SessionId,
     ) -> Result<Arc<CodexConversation>, Error> {
-        if !self
-            .sessions
-            .borrow()
-            .contains_key(&session_id.0.to_string())
-        {
-            return Err(Error::invalid_params().with_data("session not found"));
+        let (conversation_opt, conversation_id_str) = {
+            let sessions = self.sessions.borrow();
+            let state = sessions
+                .get(session_id.0.as_ref())
+                .ok_or_else(|| Error::invalid_params().with_data("session not found"))?;
+            (state.conversation.clone(), state.conversation_id.clone())
+        };
+
+        if let Some(conversation) = conversation_opt {
+            return Ok(conversation);
         }
 
-        // Get the session to find the conversation ID
-        let conversation_id = ConversationId::from_string(session_id.0.as_ref())
+        let conversation_id_string = if conversation_id_str.is_empty() {
+            session_id.0.as_ref().to_owned()
+        } else {
+            conversation_id_str
+        };
+
+        let conversation_id = ConversationId::from_string(&conversation_id_string)
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
-        self.conversation_manager
+        let conversation = self
+            .conversation_manager
             .get_conversation(conversation_id)
             .await
-            .map_err(|e| anyhow::anyhow!(e).into())
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        if let Ok(mut sessions) = self.sessions.try_borrow_mut()
+            && let Some(entry) = sessions.get_mut(session_id.0.as_ref())
+        {
+            entry.conversation = Some(conversation.clone());
+            if entry.conversation_id.is_empty() {
+                entry.conversation_id = conversation_id_string;
+            }
+        }
+
+        Ok(conversation)
     }
 
     pub fn send_message_chunk(
@@ -228,6 +372,79 @@ impl CodexAgent {
         })
         .flatten()
     }
+
+    fn describe_mcp_tool(
+        &self,
+        invocation: &McpInvocation,
+    ) -> (String, Vec<acp::ToolCallLocation>) {
+        if let Some(metadata) = self.fs_tool_metadata(invocation) {
+            let FsToolMetadata {
+                display_path,
+                location_path,
+                line,
+            } = metadata;
+            let location = acp::ToolCallLocation {
+                path: location_path,
+                line,
+                meta: None,
+            };
+            (
+                format!("{}.{} ({display_path})", invocation.server, invocation.tool),
+                vec![location],
+            )
+        } else {
+            (
+                format!("{}.{}", invocation.server, invocation.tool),
+                Vec::new(),
+            )
+        }
+    }
+
+    fn fs_tool_metadata(&self, invocation: &McpInvocation) -> Option<FsToolMetadata> {
+        if invocation.server != "acp_fs" {
+            return None;
+        }
+
+        match invocation.tool.as_str() {
+            "read_text_file" | "write_text_file" | "edit_text_file" => {}
+            _ => return None,
+        }
+
+        let args = invocation.arguments.as_ref()?.as_object()?;
+        let path = args.get("path")?.as_str()?.to_string();
+        let line = args
+            .get("line")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as u32);
+        let display_path = self.display_fs_path(&path);
+        let location_path = PathBuf::from(&path);
+
+        Some(FsToolMetadata {
+            display_path,
+            location_path,
+            line,
+        })
+    }
+
+    fn display_fs_path(&self, raw_path: &str) -> String {
+        let path = Path::new(raw_path);
+        if let Ok(relative) = path.strip_prefix(&self.config.cwd) {
+            let rel_display = relative.display().to_string();
+            if !rel_display.is_empty() {
+                return rel_display;
+            }
+        }
+
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| raw_path.to_string())
+    }
+}
+
+struct FsToolMetadata {
+    display_path: String,
+    location_path: PathBuf,
+    line: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -235,6 +452,14 @@ pub enum ClientOp {
     RequestPermission(
         acp::RequestPermissionRequest,
         Sender<Result<acp::RequestPermissionResponse, Error>>,
+    ),
+    ReadTextFile(
+        acp::ReadTextFileRequest,
+        Sender<Result<acp::ReadTextFileResponse, Error>>,
+    ),
+    WriteTextFile(
+        acp::WriteTextFileRequest,
+        Sender<Result<acp::WriteTextFileResponse, Error>>,
     ),
 }
 
@@ -325,20 +550,7 @@ impl Agent for CodexAgent {
         args: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, Error> {
         info!(?args, "Received new session request");
-        // Start a new Codex conversation for this session
-        let conversation_id = match self
-            .conversation_manager
-            .new_conversation(self.config.clone())
-            .await
-        {
-            Ok(NewConversation {
-                conversation_id, ..
-            }) => conversation_id,
-            Err(e) => {
-                warn!(error = %e, "Failed to create Codex conversation");
-                return Err(Error::into_internal_error(e));
-            }
-        };
+        let fs_session_id = Uuid::new_v4().to_string();
 
         let modes = Self::modes(&self.config);
         let current_mode = modes
@@ -346,15 +558,36 @@ impl Agent for CodexAgent {
             .map(|m| m.current_mode_id.clone())
             .unwrap_or(acp::SessionModeId("auto".into()));
 
-        let session_id = conversation_id.to_string();
-        // Populate a placeholder session entry prior to spawning Codex so that
-        // pipelined requests (like an immediate `/status`) see the session.
+        let session_config = self.build_session_config(&fs_session_id)?;
+
+        let new_conv = self
+            .conversation_manager
+            .new_conversation(session_config)
+            .await;
+
+        let (conversation, conversation_id) = match new_conv {
+            Ok(NewConversation {
+                conversation,
+                conversation_id,
+                ..
+            }) => (conversation, conversation_id),
+            Err(e) => {
+                warn!(error = %e, "Failed to create Codex conversation");
+                return Err(Error::into_internal_error(e));
+            }
+        };
+
+        let acp_session_id = conversation_id.to_string();
+
         self.sessions.borrow_mut().insert(
-            session_id.clone(),
+            acp_session_id.clone(),
             SessionState {
+                fs_session_id: fs_session_id.clone(),
+                conversation_id: acp_session_id.clone(),
+                conversation: Some(conversation.clone()),
                 current_approval: self.config.approval_policy,
                 current_sandbox: self.config.sandbox_policy.clone(),
-                current_mode,
+                current_mode: current_mode.clone(),
                 token_usage: None,
                 reasoning_sections: Vec::new(),
                 current_reasoning_chunk: String::new(),
@@ -365,7 +598,7 @@ impl Agent for CodexAgent {
         // the session is created. Send it asynchronously to avoid racing
         // with the NewSessionResponse delivery.
         {
-            let session_id = session_id.clone();
+            let session_id = acp_session_id.clone();
             let available_commands = commands::AVAILABLE_COMMANDS.to_vec();
             let tx_updates = self.session_update_tx.clone();
             task::spawn_local(async move {
@@ -383,7 +616,7 @@ impl Agent for CodexAgent {
         }
 
         Ok(acp::NewSessionResponse {
-            session_id: acp::SessionId(session_id.into()),
+            session_id: acp::SessionId(acp_session_id.clone().into()),
             modes,
             meta: None,
         })
@@ -593,14 +826,14 @@ impl Agent for CodexAgent {
                 }
                 // MCP tool calls → ACP ToolCall/ToolCallUpdate
                 EventMsg::McpToolCallBegin(begin) => {
-                    let title = format!("{}.{}", begin.invocation.server, begin.invocation.tool);
+                    let (title, locations) = self.describe_mcp_tool(&begin.invocation);
                     let tool = acp::ToolCall {
                         id: acp::ToolCallId(begin.call_id.clone().into()),
                         title,
                         kind: acp::ToolKind::Fetch,
                         status: acp::ToolCallStatus::InProgress,
                         content: Vec::new(),
-                        locations: Vec::new(),
+                        locations,
                         raw_input: begin.invocation.arguments,
                         raw_output: None,
                         meta: None,
@@ -626,14 +859,17 @@ impl Agent for CodexAgent {
                         acp::ToolCallStatus::Failed
                     };
                     let raw_output = serde_json::to_value(&end.result).ok();
+                    let (title, locations) = self.describe_mcp_tool(&end.invocation);
                     let update = acp::ToolCallUpdate {
                         id: acp::ToolCallId(end.call_id.clone().into()),
                         fields: acp::ToolCallUpdateFields {
                             status: Some(status),
-                            title: Some(format!(
-                                "{}.{}",
-                                end.invocation.server, end.invocation.tool
-                            )),
+                            title: Some(title),
+                            locations: if locations.is_empty() {
+                                None
+                            } else {
+                                Some(locations)
+                            },
                             raw_output,
                             ..Default::default()
                         },
