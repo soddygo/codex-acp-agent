@@ -243,15 +243,10 @@ impl CodexAgent {
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
-        if let Ok(mut sessions) = self.sessions.try_borrow_mut()
-            && let Some(entry) = sessions.get_mut(session_id.0.as_ref())
-        {
-            entry.conversation = Some(conversation.clone());
-            if entry.conversation_id.is_empty() {
-                entry.conversation_id = conversation_id_string;
-            }
-        }
-
+        self.with_session_state_mut(session_id, |state| {
+            state.conversation = Some(conversation.clone());
+            state.conversation_id = conversation_id_string;
+        });
         Ok(conversation)
     }
 
@@ -487,7 +482,7 @@ impl Agent for CodexAgent {
         ];
         self.client_capabilities.replace(args.client_capabilities);
         let capacities = acp::AgentCapabilities {
-            load_session: true,
+            load_session: false,
             prompt_capabilities: acp::PromptCapabilities {
                 image: true,
                 audio: false,
@@ -669,6 +664,7 @@ impl Agent for CodexAgent {
         info!(?args, "Received prompt request");
         let conversation = self.get_conversation(&args.session_id).await?;
 
+        let mut op_opt = None;
         // Handle slash commands (e.g., "/status") when the first block is text starting with '/'
         if let Some(acp::ContentBlock::Text(t)) = args.prompt.first() {
             let line = t.text.trim();
@@ -676,10 +672,11 @@ impl Agent for CodexAgent {
                 let mut parts = cmd.split_whitespace();
                 let name = parts.next().unwrap_or("").to_lowercase();
                 let rest = parts.collect::<Vec<_>>().join(" ");
-                if self
+                let (op, end) = self
                     .handle_slash_command(&args.session_id, &name, &rest)
-                    .await?
-                {
+                    .await?;
+                op_opt = op;
+                if end {
                     return Ok(acp::PromptResponse {
                         stop_reason: acp::StopReason::EndTurn,
                         meta: None,
@@ -722,9 +719,15 @@ impl Agent for CodexAgent {
             }
         }
 
+        let op = if let Some(op) = op_opt {
+            op
+        } else {
+            Op::UserInput { items }
+        };
+
         // Enqueue work and then stream corresponding events back as ACP updates.
         let submit_id = conversation
-            .submit(Op::UserInput { items })
+            .submit(op)
             .await
             .map_err(Error::into_internal_error)?;
 

@@ -16,21 +16,23 @@ impl CodexAgent {
         session_id: &acp::SessionId,
         name: &str,
         _rest: &str,
-    ) -> Result<bool, Error> {
+    ) -> Result<(Option<Op>, bool), Error> {
         let conversation = self.get_conversation(session_id).await?;
 
         // Commands implemented inline (no Codex submission needed)
         match name {
             "new" => {
                 // Start a new conversation within the current session
-                let conversation_id = match self
+                let (conversation_id, conversation) = match self
                     .conversation_manager
                     .new_conversation(self.config.clone())
                     .await
                 {
                     Ok(NewConversation {
-                        conversation_id, ..
-                    }) => conversation_id,
+                        conversation_id,
+                        conversation,
+                        ..
+                    }) => (conversation_id, conversation),
                     Err(e) => {
                         let (tx, rx) = oneshot::channel();
                         self.send_message_chunk(
@@ -39,7 +41,7 @@ impl CodexAgent {
                             tx,
                         )?;
                         rx.await.map_err(Error::into_internal_error)?;
-                        return Ok(true);
+                        return Ok((None, true));
                     }
                 };
 
@@ -48,20 +50,15 @@ impl CodexAgent {
                     .map(|m| m.current_mode_id.clone())
                     .unwrap_or(acp::SessionModeId("auto".into()));
 
-                let fs_session_id = self
-                    .sessions
-                    .borrow()
-                    .get(session_id.0.as_ref())
-                    .map(|state| state.fs_session_id.clone())
-                    .unwrap_or_else(|| session_id.0.as_ref().to_string());
+                let fs_session_id = Uuid::new_v4().to_string();
 
                 // Update the session with the new conversation
                 self.sessions.borrow_mut().insert(
-                    session_id.0.as_ref().to_string(),
+                    conversation_id.to_string(),
                     SessionState {
                         fs_session_id,
                         conversation_id: conversation_id.to_string(),
-                        conversation: None,
+                        conversation: Some(conversation.clone()),
                         current_approval: self.config.approval_policy,
                         current_sandbox: self.config.sandbox_policy.clone(),
                         current_mode,
@@ -74,104 +71,14 @@ impl CodexAgent {
                 let (tx, rx) = oneshot::channel();
                 self.send_message_chunk(session_id, "✨ Started a new conversation".into(), tx)?;
                 rx.await.map_err(Error::into_internal_error)?;
-                return Ok(true);
-            }
-            "init" => {
-                // Create AGENTS.md in the current workspace if it doesn't already exist.
-                let rest = _rest.trim();
-                let force = matches!(rest, "--force" | "-f" | "force");
-
-                // If any AGENTS* file already exists and not forcing, bail out.
-                let existing = self.find_agents_files(Some(session_id)).await;
-                if !existing.is_empty() && !force {
-                    let msg = format!(
-                        "AGENTS file already exists: {}\nUse /init --force to overwrite.",
-                        existing.join(", ")
-                    );
-
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(session_id, msg.into(), tx)?;
-                    rx.await.map_err(Error::into_internal_error)?;
-                    return Ok(true);
-                }
-
-                let target = self.config.cwd.join("AGENTS.md");
-                let template = r#"# AGENTS.md
-
-This file gives Codex instructions for working in this repository. Place project-specific tips here so the agent acts consistently with your workflows.
-
-Scope
-- The scope of this file is the entire repository (from this folder down).
-- Add more AGENTS.md files in subdirectories for overrides; deeper files take precedence.
-
-Coding Conventions
-- Keep changes minimal and focused on the task.
-- Match the existing code style and structure; avoid wholesale refactors.
-- Don't add licenses or headers unless requested.
-
-Workflow
-- How to run and test: describe commands (e.g., `cargo test`, `npm test`).
-- Any environment variables or secrets required for local runs.
-- Where to place new modules, configs, or scripts.
-
-Reviews and Safety
-- Point out risky or destructive actions before performing them.
-- Prefer root-cause fixes over band-aids.
-- When in doubt, ask for confirmation.
-
-Notes for Agents
-- Follow instructions in this file for all edits within its scope.
-- Files in deeper directories with their own AGENTS.md override these rules.
-"#;
-
-                let msg = if self.client_supports_fs_write() {
-                    match self
-                        .client_write_text_file(session_id, target.clone(), template.to_string())
-                        .await
-                    {
-                        Ok(()) => format!(
-                            "Initialized AGENTS.md at {}\nEdit it to customize agent behavior.",
-                            self.shorten_home(&target)
-                        ),
-                        Err(err) => match self.write_text_file_locally(&target, template) {
-                            Ok(()) => format!(
-                                "Initialized AGENTS.md at {}\nEdit it to customize agent behavior. (client write failed: {})",
-                                self.shorten_home(&target),
-                                err.message
-                            ),
-                            Err(io_err) => format!(
-                                "Failed to create AGENTS.md via client filesystem ({}). Local write also failed: {}.\nPath: {}",
-                                err.message,
-                                io_err,
-                                self.shorten_home(&target)
-                            ),
-                        },
-                    }
-                } else {
-                    match self.write_text_file_locally(&target, template) {
-                        Ok(()) => format!(
-                            "Initialized AGENTS.md at {}\nEdit it to customize agent behavior.",
-                            self.shorten_home(&target)
-                        ),
-                        Err(e) => format!(
-                            "Failed to create AGENTS.md: {}\nPath: {}",
-                            e,
-                            self.shorten_home(&target)
-                        ),
-                    }
-                };
-
-                let (tx, rx) = oneshot::channel();
-                self.send_message_chunk(session_id, msg.into(), tx)?;
-                rx.await.map_err(Error::into_internal_error)?;
-                return Ok(true);
+                return Ok((None, true));
             }
             "status" => {
                 let status_text = self.render_status(session_id).await;
                 let (tx, rx) = oneshot::channel();
                 self.send_message_chunk(session_id, status_text.into(), tx)?;
                 rx.await.map_err(Error::into_internal_error)?;
-                return Ok(true);
+                return Ok((None, true));
             }
             "model" => {
                 let rest = _rest.trim();
@@ -183,7 +90,7 @@ Notes for Agents
                     let (tx, rx) = oneshot::channel();
                     self.send_message_chunk(session_id, msg.into(), tx)?;
                     rx.await.map_err(Error::into_internal_error)?;
-                    return Ok(true);
+                    return Ok((None, true));
                 }
 
                 // Request Codex to change the model for subsequent turns.
@@ -209,7 +116,7 @@ Notes for Agents
                     tx,
                 )?;
                 rx.await.map_err(Error::into_internal_error)?;
-                return Ok(true);
+                return Ok((None, true));
             }
             "approvals" => {
                 let mode = _rest.trim().to_lowercase();
@@ -220,7 +127,7 @@ Notes for Agents
                     let (tx, rx) = oneshot::channel();
                     self.send_message_chunk(session_id, msg.into(), tx)?;
                     rx.await.map_err(Error::into_internal_error)?;
-                    return Ok(true);
+                    return Ok((None, true));
                 }
 
                 let preset = APPROVAL_PRESETS
@@ -247,7 +154,7 @@ Notes for Agents
                         tx,
                     )?;
                     rx.await.map_err(Error::into_internal_error)?;
-                    return Ok(true);
+                    return Ok((None, true));
                 }
 
                 // Persist our local view of the policy for /status
@@ -271,27 +178,21 @@ Notes for Agents
                     ))
                     .map_err(Error::into_internal_error)?;
                 rx.await.map_err(Error::into_internal_error)?;
-                return Ok(true);
+                return Ok((None, true));
             }
             "quit" => {
                 // Say goodbye and submit Shutdown to Codex if available
-                let quit_msg = "👋 Codex agent is shutting down. Goodbye!";
+                let mut quit_msg = "👋 Codex agent is shutting down. Goodbye!".into();
                 // Request backend shutdown
                 if let Err(e) = conversation.submit(Op::Shutdown).await {
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(
-                        session_id,
-                        format!("Failed to submit shutdown: {}", e).into(),
-                        tx,
-                    )?;
-                    let _ = rx.await;
-                    return Ok(true);
+                    quit_msg = format!("Failed to submit shutdown: {}", e);
                 }
+
                 // Send the goodbye message
                 let (tx, rx) = oneshot::channel();
                 self.send_message_chunk(session_id, quit_msg.into(), tx)?;
                 let _ = rx.await;
-                return Ok(true);
+                return Ok((None, true));
             }
             _ => {}
         }
@@ -299,6 +200,56 @@ Notes for Agents
         let mut msg = String::default();
         // Commands forwarded to Codex as protocol Ops
         let op = match name {
+            "init" => {
+                let prompt = r#"
+Generate a file named AGENTS.md that serves as a contributor guide for this repository.
+Your goal is to produce a clear, concise, and well-structured document with descriptive headings and actionable explanations for each section.
+Follow the outline below, but adapt as needed — add sections if relevant, and omit those that do not apply to this project.
+
+Document Requirements
+
+- Title the document "Repository Guidelines".
+- Use Markdown headings (#, ##, etc.) for structure.
+- Keep the document concise. 200-400 words is optimal.
+- Keep explanations short, direct, and specific to this repository.
+- Provide examples where helpful (commands, directory paths, naming patterns).
+- Maintain a professional, instructional tone.
+
+Recommended Sections
+
+Project Structure & Module Organization
+
+- Outline the project structure, including where the source code, tests, and assets are located.
+
+Build, Test, and Development Commands
+
+- List key commands for building, testing, and running locally (e.g., npm test, make build).
+- Briefly explain what each command does.
+
+Coding Style & Naming Conventions
+
+- Specify indentation rules, language-specific style preferences, and naming patterns.
+- Include any formatting or linting tools used.
+
+Testing Guidelines
+
+- Identify testing frameworks and coverage requirements.
+- State test naming conventions and how to run tests.
+
+Commit & Pull Request Guidelines
+
+- Summarize commit message conventions found in the project’s Git history.
+- Outline pull request requirements (descriptions, linked issues, screenshots, etc.).
+
+(Optional) Add other sections if relevant, such as Security & Configuration Tips, Architecture Overview, or Agent-Specific Instructions.
+"#;
+                msg = "📝 Creating AGENTS.md file with initial instructions...\n\n".into();
+                Some(Op::UserInput {
+                    items: vec![InputItem::Text {
+                        text: prompt.into(),
+                    }],
+                })
+            }
             "compact" => {
                 self.with_session_state_mut(session_id, |state| {
                     state.token_usage = None;
@@ -318,69 +269,13 @@ Notes for Agents
             _ => None,
         };
 
-        if let Some(op) = op {
-            let submit_result = conversation.submit(op).await;
-            if let Err(e) = submit_result {
-                let (tx, rx) = oneshot::channel();
-                self.send_message_chunk(
-                    session_id,
-                    format!("Failed to submit message: {}", e).into(),
-                    tx,
-                )?;
-                rx.await.map_err(Error::into_internal_error)?;
-                return Ok(true);
-            }
-
+        if !msg.is_empty() {
             let (tx, rx) = oneshot::channel();
             self.send_message_chunk(session_id, msg.into(), tx)?;
             rx.await.map_err(Error::into_internal_error)?;
-
-            loop {
-                let event = conversation
-                    .next_event()
-                    .await
-                    .map_err(Error::into_internal_error)?;
-
-                match event.msg {
-                    EventMsg::ExitedReviewMode(e) => {
-                        if let Some(review_output) = e.review_output {
-                            let (tx, rx) = oneshot::channel();
-                            self.send_message_chunk(
-                                session_id,
-                                serde_json::to_string_pretty(&review_output)
-                                    .unwrap_or_else(|_| "<failed to serialize>".to_string())
-                                    .into(),
-                                tx,
-                            )?;
-                            rx.await.map_err(Error::into_internal_error)?;
-                        }
-                    }
-                    EventMsg::TaskComplete(_) | EventMsg::ShutdownComplete => {
-                        let (tx, rx) = oneshot::channel();
-                        self.send_message_chunk(session_id, "Task completed".into(), tx)?;
-                        rx.await.map_err(Error::into_internal_error)?;
-                        break;
-                    }
-                    EventMsg::StreamError(err) => {
-                        let (tx, rx) = oneshot::channel();
-                        let mut msg = err.message;
-                        msg.push_str("\n\n");
-                        self.send_message_chunk(session_id, msg.into(), tx)?;
-                        rx.await.map_err(Error::into_internal_error)?;
-                    }
-                    EventMsg::Error(err) => {
-                        let (tx, rx) = oneshot::channel();
-                        self.send_message_chunk(session_id, err.message.into(), tx)?;
-                        rx.await.map_err(Error::into_internal_error)?;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            return Ok(true);
         }
 
-        Ok(false)
+        Ok((op, false))
     }
 
     async fn render_status(&self, session_id: &acp::SessionId) -> String {
@@ -510,7 +405,7 @@ Notes for Agents
         status
     }
 
-    fn shorten_home(&self, p: &std::path::Path) -> String {
+    fn shorten_home(&self, p: &Path) -> String {
         let s = p.display().to_string();
         if let Ok(home) = std::env::var("HOME")
             && s.starts_with(&home)
@@ -554,6 +449,7 @@ Notes for Agents
         self.client_capabilities.borrow().fs.read_text_file
     }
 
+    #[allow(dead_code)]
     fn client_supports_fs_write(&self) -> bool {
         self.client_capabilities.borrow().fs.write_text_file
     }
@@ -561,7 +457,7 @@ Notes for Agents
     async fn client_read_text_file(
         &self,
         session_id: &acp::SessionId,
-        path: std::path::PathBuf,
+        path: PathBuf,
         line: Option<u32>,
         limit: Option<u32>,
     ) -> Result<acp::ReadTextFileResponse, Error> {
@@ -583,10 +479,11 @@ Notes for Agents
         })?
     }
 
+    #[allow(dead_code)]
     async fn client_write_text_file(
         &self,
         session_id: &acp::SessionId,
-        path: std::path::PathBuf,
+        path: PathBuf,
         content: String,
     ) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
@@ -607,7 +504,8 @@ Notes for Agents
         response.map(|_| ())
     }
 
-    fn write_text_file_locally(&self, path: &std::path::Path, content: &str) -> io::Result<()> {
+    #[allow(dead_code)]
+    fn write_text_file_locally(&self, path: &Path, content: &str) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }

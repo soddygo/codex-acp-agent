@@ -3,6 +3,7 @@ mod fs;
 
 use agent_client_protocol::{AgentSideConnection, Client, Error};
 use anyhow::Result;
+use std::env;
 use tokio::{io, sync::mpsc, task};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 use tracing::error;
@@ -13,7 +14,7 @@ use codex_core::config::{Config, ConfigOverrides};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("--acp-fs-mcp") {
+    if env::args().nth(1).as_deref() == Some("--acp-fs-mcp") {
         return fs::run_mcp_server().await;
     }
 
