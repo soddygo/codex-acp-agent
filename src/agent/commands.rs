@@ -34,13 +34,11 @@ impl CodexAgent {
                         ..
                     }) => (conversation_id, conversation),
                     Err(e) => {
-                        let (tx, rx) = oneshot::channel();
                         self.send_message_chunk(
                             session_id,
                             format!("Failed to start new conversation: {}", e).into(),
-                            tx,
-                        )?;
-                        rx.await.map_err(Error::into_internal_error)?;
+                        )
+                        .await?;
                         return Ok((None, true));
                     }
                 };
@@ -68,16 +66,14 @@ impl CodexAgent {
                     },
                 );
 
-                let (tx, rx) = oneshot::channel();
-                self.send_message_chunk(session_id, "✨ Started a new conversation".into(), tx)?;
-                rx.await.map_err(Error::into_internal_error)?;
+                self.send_message_chunk(session_id, "✨ Started a new conversation".into())
+                    .await?;
                 return Ok((None, true));
             }
             "status" => {
                 let status_text = self.render_status(session_id).await;
-                let (tx, rx) = oneshot::channel();
-                self.send_message_chunk(session_id, status_text.into(), tx)?;
-                rx.await.map_err(Error::into_internal_error)?;
+                self.send_message_chunk(session_id, status_text.into())
+                    .await?;
                 return Ok((None, true));
             }
             "model" => {
@@ -87,9 +83,7 @@ impl CodexAgent {
                         "Current model: {}\nUsage: /model <model-slug>",
                         self.config.model,
                     );
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(session_id, msg.into(), tx)?;
-                    rx.await.map_err(Error::into_internal_error)?;
+                    self.send_message_chunk(session_id, msg.into()).await?;
                     return Ok((None, true));
                 }
 
@@ -109,13 +103,11 @@ impl CodexAgent {
                     .map_err(Error::into_internal_error)?;
 
                 // Provide immediate feedback to the user.
-                let (tx, rx) = oneshot::channel();
                 self.send_message_chunk(
                     session_id,
                     format!("🧠 Requested model change to: `{}`", rest).into(),
-                    tx,
-                )?;
-                rx.await.map_err(Error::into_internal_error)?;
+                )
+                .await?;
                 return Ok((None, true));
             }
             "approvals" => {
@@ -124,9 +116,7 @@ impl CodexAgent {
 
                 if !allowed.contains(&mode.as_str()) {
                     let msg = format!("Usage: /approvals {}", allowed.join("|"));
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(session_id, msg.into(), tx)?;
-                    rx.await.map_err(Error::into_internal_error)?;
+                    self.send_message_chunk(session_id, msg.into()).await?;
                     return Ok((None, true));
                 }
 
@@ -147,13 +137,11 @@ impl CodexAgent {
                     .await;
 
                 if let Err(e) = submit_result {
-                    let (tx, rx) = oneshot::channel();
                     self.send_message_chunk(
                         session_id,
                         format!("⚠️ Failed to set approval policy: {}", e).into(),
-                        tx,
-                    )?;
-                    rx.await.map_err(Error::into_internal_error)?;
+                    )
+                    .await?;
                     return Ok((None, true));
                 }
 
@@ -189,9 +177,7 @@ impl CodexAgent {
                 }
 
                 // Send the goodbye message
-                let (tx, rx) = oneshot::channel();
-                self.send_message_chunk(session_id, quit_msg.into(), tx)?;
-                let _ = rx.await;
+                self.send_message_chunk(session_id, quit_msg.into()).await?;
                 return Ok((None, true));
             }
             _ => {}
@@ -270,9 +256,7 @@ Commit & Pull Request Guidelines
         };
 
         if !msg.is_empty() {
-            let (tx, rx) = oneshot::channel();
-            self.send_message_chunk(session_id, msg.into(), tx)?;
-            rx.await.map_err(Error::into_internal_error)?;
+            self.send_message_chunk(session_id, msg.into()).await?;
         }
 
         Ok((op, false))

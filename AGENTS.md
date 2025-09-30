@@ -20,29 +20,26 @@
 ## Coding Style & Naming Conventions
 - Rust 2024 edition; 4-space indentation; `rustfmt` enforced.
 - Naming: `snake_case` (functions/vars), `CamelCase` (types/traits), `SCREAMING_SNAKE_CASE` (consts).
-- Imports: explicit paths; group std/crate/local; keep unused imports out.
+- Imports: explicit paths; group std/crate/local; avoid unused imports.
 - Errors: prefer `anyhow::Result<T>` at boundaries; map external errors early.
 - Logging: use `tracing`; gate verbosity with `RUST_LOG`.
 
 ## Testing Guidelines
 - Unit tests inline via `#[cfg(test)] mod tests { ... }`; keep deterministic (avoid timing races).
-- Integration tests in `tests/` (e.g., `agent_status_test.rs`).
+- Integration tests in `tests/` (e.g., `tests/agent_status_test.rs`).
 - Name tests by behavior in `snake_case` (e.g., `advertises_available_commands`).
 - Run with `cargo test`; ensure `cargo clippy` passes before pushing.
 
 ## Commit & Pull Request Guidelines
 - Commits: small, focused; use Conventional Commits (`feat:`, `fix:`, `refactor:`).
-- Pull Requests include:
-  - Problem statement and approach; link issues.
-  - Test plan (commands run, expected output) with relevant `RUST_LOG` snippets.
-  - Screenshots/logs for ACP interactions when helpful.
+- Pull Requests include: problem statement and approach; linked issues; test plan (commands run, expected output) with relevant `RUST_LOG` snippets; screenshots/logs for ACP interactions when helpful.
 
 ## Security & Configuration Tips
-- Auth: use `codex login` (ChatGPT) or `OPENAI_API_KEY` for API key mode.
+- Auth: use `codex login` or `OPENAI_API_KEY` for API key mode.
 - Secrets: never commit keys or `auth.json`; use env/OS keychain.
-- Network: first build fetches git dependencies; subsequent builds are cached.
+- Network: first build fetches git dependencies; subsequent builds cached.
 - Safety: default to on-request approvals; avoid destructive examples.
 
-## Agent-Specific Notes
+## Agent-Specific Instructions
 - Add new slash commands in `src/agent/commands.rs`; document usage in help output.
-- Prefer clear, actionable logs and deterministic async flows (use `LocalSet` where applicable).
+- Prefer clear, actionable logs and deterministic async flows (use `LocalSet` where applicable`).

@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::env;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock, RwLock};
@@ -130,7 +131,7 @@ impl CodexAgent {
         session_id: &str,
         bridge: &FsBridge,
     ) -> Result<McpServerConfig, Error> {
-        let exe_path = std::env::current_exe().map_err(|err| {
+        let exe_path = env::current_exe().map_err(|err| {
             Error::internal_error().with_data(format!("failed to locate agent binary: {err}"))
         })?;
 
@@ -250,12 +251,12 @@ impl CodexAgent {
         Ok(conversation)
     }
 
-    pub fn send_message_chunk(
+    pub async fn send_message_chunk(
         &self,
         session_id: &acp::SessionId,
         content: acp::ContentBlock,
-        tx: Sender<()>,
     ) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
         self.session_update_tx
             .send((
                 acp::SessionNotification {
@@ -266,15 +267,15 @@ impl CodexAgent {
                 tx,
             ))
             .map_err(Error::into_internal_error)?;
-        Ok(())
+        rx.await.map_err(Error::into_internal_error)
     }
 
-    pub fn send_thought_chunk(
+    pub async fn send_thought_chunk(
         &self,
         session_id: &acp::SessionId,
         content: acp::ContentBlock,
-        tx: Sender<()>,
     ) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
         self.session_update_tx
             .send((
                 acp::SessionNotification {
@@ -285,20 +286,16 @@ impl CodexAgent {
                 tx,
             ))
             .map_err(Error::into_internal_error)?;
-        Ok(())
+        rx.await.map_err(Error::into_internal_error)
     }
 
     fn handle_response_outcome(&self, resp: acp::RequestPermissionResponse) -> ReviewDecision {
         match resp.outcome {
-            acp::RequestPermissionOutcome::Selected { option_id } => {
-                if option_id.0.as_ref() == "approve" {
-                    ReviewDecision::Approved
-                } else if option_id.0.as_ref() == "approve_for_session" {
-                    ReviewDecision::ApprovedForSession
-                } else {
-                    ReviewDecision::Denied
-                }
-            }
+            acp::RequestPermissionOutcome::Selected { option_id } => match option_id.0.as_ref() {
+                "approved" => ReviewDecision::Approved,
+                "approved-for-session" => ReviewDecision::ApprovedForSession,
+                _ => ReviewDecision::Denied,
+            },
             acp::RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
         }
     }
@@ -719,10 +716,9 @@ impl Agent for CodexAgent {
             }
         }
 
-        let op = if let Some(op) = op_opt {
-            op
-        } else {
-            Op::UserInput { items }
+        let op = match op_opt {
+            Some(op) => op,
+            None => Op::UserInput { items },
         };
 
         // Enqueue work and then stream corresponding events back as ACP updates.
@@ -733,27 +729,21 @@ impl Agent for CodexAgent {
 
         let permission_opts = Arc::new(vec![
             acp::PermissionOption {
-                id: acp::PermissionOptionId("allow_always".into()),
-                name: "Allow Always".into(),
+                id: acp::PermissionOptionId("approved-for-session".into()),
+                name: "Approved Always".into(),
                 kind: acp::PermissionOptionKind::AllowAlways,
                 meta: None,
             },
             acp::PermissionOption {
-                id: acp::PermissionOptionId("allow_once".into()),
-                name: "Allow Once".into(),
+                id: acp::PermissionOptionId("approved".into()),
+                name: "Approved".into(),
                 kind: acp::PermissionOptionKind::AllowOnce,
                 meta: None,
             },
             acp::PermissionOption {
-                id: acp::PermissionOptionId("reject_once".into()),
-                name: "Reject Once".into(),
+                id: acp::PermissionOptionId("abort".into()),
+                name: "Reject".into(),
                 kind: acp::PermissionOptionKind::RejectOnce,
-                meta: None,
-            },
-            acp::PermissionOption {
-                id: acp::PermissionOptionId("reject_always".into()),
-                name: "Reject Always".into(),
-                kind: acp::PermissionOptionKind::RejectAlways,
                 meta: None,
             },
         ]);
@@ -771,17 +761,15 @@ impl Agent for CodexAgent {
             match event.msg {
                 EventMsg::AgentMessageDelta(delta) => {
                     saw_message_delta = true;
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(&args.session_id, delta.delta.into(), tx)?;
-                    rx.await.map_err(Error::into_internal_error)?;
+                    self.send_message_chunk(&args.session_id, delta.delta.into())
+                        .await?;
                 }
                 EventMsg::AgentMessage(msg) => {
                     if saw_message_delta {
                         continue;
                     }
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(&args.session_id, msg.message.into(), tx)?;
-                    rx.await.map_err(Error::into_internal_error)?;
+                    self.send_message_chunk(&args.session_id, msg.message.into())
+                        .await?;
                 }
                 EventMsg::AgentReasoningDelta(delta) => {
                     self.append_reasoning_delta(&args.session_id, &delta.delta);
@@ -813,9 +801,8 @@ impl Agent for CodexAgent {
                     if let Some(text) = content
                         && !text.trim().is_empty()
                     {
-                        let (tx, rx) = oneshot::channel();
-                        self.send_thought_chunk(&args.session_id, text.clone().into(), tx)?;
-                        rx.await.map_err(Error::into_internal_error)?;
+                        self.send_thought_chunk(&args.session_id, text.clone().into())
+                            .await?;
                     }
                 }
                 EventMsg::AgentReasoningRawContent(reason) => {
@@ -1102,15 +1089,11 @@ impl Agent for CodexAgent {
                     break acp::StopReason::EndTurn;
                 }
                 EventMsg::Error(err) => {
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(&args.session_id, err.message.into(), tx)?;
-                    let _ = rx.await;
+                    self.send_message_chunk(&args.session_id, err.message.into())
+                        .await?;
                     break acp::StopReason::EndTurn;
                 }
                 EventMsg::TurnAborted(_) => {
-                    let (tx, rx) = oneshot::channel();
-                    self.send_message_chunk(&args.session_id, "".into(), tx)?;
-                    let _ = rx.await;
                     break acp::StopReason::Cancelled;
                 }
                 // Ignore other events for now.
@@ -1121,9 +1104,8 @@ impl Agent for CodexAgent {
         if let Some(text) = self.take_reasoning_text(&args.session_id)
             && !text.trim().is_empty()
         {
-            let (tx, rx) = oneshot::channel();
-            self.send_thought_chunk(&args.session_id, text.into(), tx)?;
-            rx.await.map_err(Error::into_internal_error)?;
+            self.send_thought_chunk(&args.session_id, text.into())
+                .await?;
         }
 
         Ok(acp::PromptResponse {
