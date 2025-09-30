@@ -13,8 +13,8 @@ use codex_core::{
     config::Config as CodexConfig,
     config_types::{McpServerConfig, McpServerTransportConfig},
     protocol::{
-        AskForApproval, EventMsg, InputItem, McpInvocation, Op, ReviewDecision, SandboxPolicy,
-        TokenUsage,
+        AskForApproval, ErrorEvent, EventMsg, InputItem, McpInvocation, Op, PatchApplyEndEvent,
+        ReviewDecision, SandboxPolicy, StreamErrorEvent, TokenUsage,
     },
 };
 use codex_protocol::mcp_protocol::{AuthMode, ConversationId};
@@ -882,7 +882,7 @@ impl Agent for CodexAgent {
                 EventMsg::ExecCommandBegin(beg) => {
                     let tool = acp::ToolCall {
                         id: acp::ToolCallId(beg.call_id.clone().into()),
-                        title: beg.command.join(" "),
+                        title: format!("Running {}", beg.command.join(" ")),
                         kind: acp::ToolKind::Execute,
                         status: acp::ToolCallStatus::InProgress,
                         content: Vec::new(),
@@ -1078,6 +1078,42 @@ impl Agent for CodexAgent {
                             .map_err(Error::into_internal_error)?;
                     }
                 }
+                EventMsg::PatchApplyEnd(event) => {
+                    let raw_output = serde_json::json!(&event);
+                    let PatchApplyEndEvent {
+                        call_id,
+                        stdout: _,
+                        stderr: _,
+                        success,
+                    } = event;
+
+                    let update = acp::ToolCallUpdate {
+                        id: acp::ToolCallId(call_id.into()),
+                        fields: acp::ToolCallUpdateFields {
+                            status: Some(if success {
+                                acp::ToolCallStatus::Completed
+                            } else {
+                                acp::ToolCallStatus::Failed
+                            }),
+                            raw_output: Some(raw_output),
+                            ..Default::default()
+                        },
+                        meta: None,
+                    };
+
+                    let (tx, rx) = oneshot::channel();
+                    self.session_update_tx
+                        .send((
+                            acp::SessionNotification {
+                                session_id: args.session_id.clone(),
+                                update: acp::SessionUpdate::ToolCallUpdate(update),
+                                meta: None,
+                            },
+                            tx,
+                        ))
+                        .map_err(Error::into_internal_error)?;
+                    rx.await.map_err(Error::into_internal_error)?;
+                }
                 EventMsg::TokenCount(tc) => {
                     if let Some(info) = tc.info {
                         self.with_session_state_mut(&args.session_id, |state| {
@@ -1088,12 +1124,14 @@ impl Agent for CodexAgent {
                 EventMsg::TaskComplete(_) => {
                     break acp::StopReason::EndTurn;
                 }
-                EventMsg::Error(err) => {
-                    self.send_message_chunk(&args.session_id, err.message.into())
+                EventMsg::Error(ErrorEvent { message })
+                | EventMsg::StreamError(StreamErrorEvent { message }) => {
+                    let mut msg = String::from(&message);
+                    msg.push_str("\n\n");
+                    self.send_message_chunk(&args.session_id, msg.into())
                         .await?;
-                    break acp::StopReason::EndTurn;
                 }
-                EventMsg::TurnAborted(_) => {
+                EventMsg::ShutdownComplete | EventMsg::TurnAborted(_) => {
                     break acp::StopReason::Cancelled;
                 }
                 // Ignore other events for now.
