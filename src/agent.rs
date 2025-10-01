@@ -6,8 +6,10 @@ use std::rc::Rc;
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
-use agent_client_protocol::{self as acp, Agent, Error, V1};
+use agent_client_protocol::{self as acp, Agent, Error, PlanEntry, V1};
+use codex_app_server_protocol::AuthMode;
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
+use codex_core::plan_tool::{StepStatus, UpdatePlanArgs};
 use codex_core::{
     AuthManager, CodexConversation, ConversationManager, NewConversation,
     config::Config as CodexConfig,
@@ -17,7 +19,7 @@ use codex_core::{
         ReviewDecision, SandboxPolicy, StreamErrorEvent, TokenUsage,
     },
 };
-use codex_protocol::mcp_protocol::{AuthMode, ConversationId};
+use codex_protocol::ConversationId;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot, oneshot::Sender};
 use tokio::task;
@@ -294,7 +296,7 @@ impl CodexAgent {
             acp::RequestPermissionOutcome::Selected { option_id } => match option_id.0.as_ref() {
                 "approved" => ReviewDecision::Approved,
                 "approved-for-session" => ReviewDecision::ApprovedForSession,
-                _ => ReviewDecision::Denied,
+                _ => ReviewDecision::Abort,
             },
             acp::RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
         }
@@ -1120,6 +1122,46 @@ impl Agent for CodexAgent {
                             state.token_usage = Some(info.total_token_usage.clone());
                         });
                     }
+                }
+                EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
+                    if let Some(content) = explanation {
+                        self.send_message_chunk(&args.session_id, content.into())
+                            .await?;
+                    }
+
+                    let entries: Vec<PlanEntry> = plan
+                        .iter()
+                        .map(|item| {
+                            let status = match item.status {
+                                StepStatus::Pending => acp::PlanEntryStatus::Pending,
+                                StepStatus::InProgress => acp::PlanEntryStatus::InProgress,
+                                StepStatus::Completed => acp::PlanEntryStatus::Completed,
+                            };
+
+                            acp::PlanEntry {
+                                content: item.step.clone(),
+                                priority: acp::PlanEntryPriority::Medium,
+                                status,
+                                meta: None,
+                            }
+                        })
+                        .collect();
+
+                    let (tx, rx) = oneshot::channel();
+                    self.session_update_tx
+                        .send((
+                            acp::SessionNotification {
+                                session_id: args.session_id.clone(),
+                                update: acp::SessionUpdate::Plan(acp::Plan {
+                                    entries,
+                                    meta: None,
+                                }),
+                                meta: None,
+                            },
+                            tx,
+                        ))
+                        .map_err(Error::into_internal_error)?;
+                    let _ = rx.await;
                 }
                 EventMsg::TaskComplete(_) => {
                     break acp::StopReason::EndTurn;
