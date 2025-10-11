@@ -9,7 +9,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt 
 use tracing::error;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::agent::CodexAgent;
+use crate::agent::{CodexAgent, SessionModeLookup};
 use codex_core::config::{Config, ConfigOverrides};
 
 #[tokio::main(flavor = "current_thread")]
@@ -33,10 +33,10 @@ async fn main() -> Result<()> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (client_tx, mut client_rx) = mpsc::unbounded_channel();
 
-        let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default())?;
+        let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default()).await?;
         let fs_bridge = fs::FsBridge::start(client_tx.clone(), config.cwd.clone()).await?;
         let agent = CodexAgent::with_config(tx, client_tx, config, Some(fs_bridge));
-        let session_modes = agent.session_mode_lookup();
+        let session_modes = SessionModeLookup::from(&agent);
         let (conn, handle_io) = AgentSideConnection::new(agent, outgoing, incoming, |fut| {
             task::spawn_local(fut);
         });

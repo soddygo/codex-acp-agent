@@ -9,17 +9,19 @@ use std::time::Duration;
 use agent_client_protocol::{self as acp, Agent, Error, PlanEntry, V1};
 use codex_app_server_protocol::AuthMode;
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
-use codex_core::plan_tool::{StepStatus, UpdatePlanArgs};
 use codex_core::{
     AuthManager, CodexConversation, ConversationManager, NewConversation,
     config::Config as CodexConfig,
     config_types::{McpServerConfig, McpServerTransportConfig},
     protocol::{
         AskForApproval, ErrorEvent, EventMsg, InputItem, McpInvocation, Op, PatchApplyEndEvent,
-        ReviewDecision, SandboxPolicy, StreamErrorEvent, TokenUsage,
+        ReviewDecision, SandboxPolicy, SessionSource, StreamErrorEvent, TokenUsage,
     },
 };
-use codex_protocol::ConversationId;
+use codex_protocol::{
+    ConversationId,
+    plan_tool::{StepStatus, UpdatePlanArgs},
+};
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot, oneshot::Sender};
 use tokio::task;
@@ -37,8 +39,6 @@ pub static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> =
 // handle, its id (for status/reporting), and bookkeeping for streaming.
 #[derive(Clone)]
 struct SessionState {
-    // Conversation id string for display/logging purposes.
-    conversation_id: String,
     fs_session_id: String,
     conversation: Option<Arc<CodexConversation>>,
     current_approval: AskForApproval,
@@ -52,6 +52,14 @@ struct SessionState {
 #[derive(Clone)]
 pub struct SessionModeLookup {
     inner: Rc<RefCell<HashMap<String, SessionState>>>,
+}
+
+impl From<&CodexAgent> for SessionModeLookup {
+    fn from(agent: &CodexAgent) -> Self {
+        Self {
+            inner: agent.sessions.clone(),
+        }
+    }
 }
 
 impl SessionModeLookup {
@@ -107,8 +115,8 @@ impl CodexAgent {
         config: CodexConfig,
         fs_bridge: Option<Arc<FsBridge>>,
     ) -> Self {
-        let auth = AuthManager::shared(config.codex_home.clone());
-        let conversation_manager = ConversationManager::new(auth.clone());
+        let auth = AuthManager::shared(config.codex_home.clone(), false);
+        let conversation_manager = ConversationManager::new(auth.clone(), SessionSource::Unknown);
 
         Self {
             session_update_tx,
@@ -119,12 +127,6 @@ impl CodexAgent {
             client_tx,
             client_capabilities: RefCell::new(Default::default()),
             fs_bridge,
-        }
-    }
-
-    pub fn session_mode_lookup(&self) -> SessionModeLookup {
-        SessionModeLookup {
-            inner: self.sessions.clone(),
         }
     }
 
@@ -150,6 +152,7 @@ impl CodexAgent {
                 args: vec!["--acp-fs-mcp".to_string()],
                 env: Some(env),
             },
+            enabled: true,
             startup_timeout_sec: Some(Duration::from_secs(5)),
             tool_timeout_sec: Some(Duration::from_secs(30)),
         })
@@ -157,7 +160,7 @@ impl CodexAgent {
 
     fn build_session_config(&self, session_id: &str) -> Result<CodexConfig, Error> {
         let mut session_config = self.config.clone();
-        let fs_guidance = "For workspace file I/O, use the acp_fs MCP tools.\nFollow this workflow:\n1. Call read_text_file once to capture the current content. Results are paged (≈1000 lines / 50KB) and include a <file-read-info> hint when more remains—follow it with the line/limit parameters instead of re-reading from the top, and reuse that snapshot unless the file actually changed.\n2. Plan edits locally instead of mutating files via shell commands.\n3. Apply replacements with edit_text_file (or multi_edit_text_file for multiple sequential edits); these now write through the bridge immediately and return the unified diff with line metadata.\n4. Use write_text_file only when sending a full file replacement.\n\nAvoid issuing redundant read_text_file calls; rely on the content you already loaded unless an external process has modified the file.\nKeep all planning, tool selection, and step-by-step reasoning inside <thinking> blocks (statements like “I'll apply a focused edit…” belong there) so only final answers appear outside them.";
+        let fs_guidance = include_str!("./prompt_fs_guidance.md");
 
         if let Some(mut base) = session_config.base_instructions.take() {
             if !base.contains("acp_fs") {
@@ -219,25 +222,19 @@ impl CodexAgent {
         &self,
         session_id: &acp::SessionId,
     ) -> Result<Arc<CodexConversation>, Error> {
-        let (conversation_opt, conversation_id_str) = {
+        let conversation_opt = {
             let sessions = self.sessions.borrow();
             let state = sessions
                 .get(session_id.0.as_ref())
                 .ok_or_else(|| Error::invalid_params().with_data("session not found"))?;
-            (state.conversation.clone(), state.conversation_id.clone())
+            state.conversation.clone()
         };
 
         if let Some(conversation) = conversation_opt {
             return Ok(conversation);
         }
 
-        let conversation_id_string = if conversation_id_str.is_empty() {
-            session_id.0.as_ref().to_owned()
-        } else {
-            conversation_id_str
-        };
-
-        let conversation_id = ConversationId::from_string(&conversation_id_string)
+        let conversation_id = ConversationId::from_string(session_id.0.as_ref())
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
         let conversation = self
@@ -248,9 +245,27 @@ impl CodexAgent {
 
         self.with_session_state_mut(session_id, |state| {
             state.conversation = Some(conversation.clone());
-            state.conversation_id = conversation_id_string;
         });
         Ok(conversation)
+    }
+
+    pub async fn send_session_update(
+        &self,
+        session_id: &acp::SessionId,
+        update: acp::SessionUpdate,
+    ) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
+        self.session_update_tx
+            .send((
+                acp::SessionNotification {
+                    session_id: session_id.clone(),
+                    update,
+                    meta: None,
+                },
+                tx,
+            ))
+            .map_err(Error::into_internal_error)?;
+        rx.await.map_err(Error::into_internal_error)
     }
 
     pub async fn send_message_chunk(
@@ -258,18 +273,11 @@ impl CodexAgent {
         session_id: &acp::SessionId,
         content: acp::ContentBlock,
     ) -> Result<(), Error> {
-        let (tx, rx) = oneshot::channel();
-        self.session_update_tx
-            .send((
-                acp::SessionNotification {
-                    session_id: session_id.clone(),
-                    update: acp::SessionUpdate::AgentMessageChunk { content },
-                    meta: None,
-                },
-                tx,
-            ))
-            .map_err(Error::into_internal_error)?;
-        rx.await.map_err(Error::into_internal_error)
+        self.send_session_update(
+            session_id,
+            acp::SessionUpdate::AgentMessageChunk { content },
+        )
+        .await
     }
 
     pub async fn send_thought_chunk(
@@ -277,18 +285,11 @@ impl CodexAgent {
         session_id: &acp::SessionId,
         content: acp::ContentBlock,
     ) -> Result<(), Error> {
-        let (tx, rx) = oneshot::channel();
-        self.session_update_tx
-            .send((
-                acp::SessionNotification {
-                    session_id: session_id.clone(),
-                    update: acp::SessionUpdate::AgentThoughtChunk { content },
-                    meta: None,
-                },
-                tx,
-            ))
-            .map_err(Error::into_internal_error)?;
-        rx.await.map_err(Error::into_internal_error)
+        self.send_session_update(
+            session_id,
+            acp::SessionUpdate::AgentThoughtChunk { content },
+        )
+        .await
     }
 
     fn handle_response_outcome(&self, resp: acp::RequestPermissionResponse) -> ReviewDecision {
@@ -577,7 +578,6 @@ impl Agent for CodexAgent {
             acp_session_id.clone(),
             SessionState {
                 fs_session_id: fs_session_id.clone(),
-                conversation_id: acp_session_id.clone(),
                 conversation: Some(conversation.clone()),
                 current_approval: self.config.approval_policy,
                 current_sandbox: self.config.sandbox_policy.clone(),
@@ -671,16 +671,19 @@ impl Agent for CodexAgent {
                 let mut parts = cmd.split_whitespace();
                 let name = parts.next().unwrap_or("").to_lowercase();
                 let rest = parts.collect::<Vec<_>>().join(" ");
-                let (op, end) = self
+                if self
                     .handle_slash_command(&args.session_id, &name, &rest)
-                    .await?;
-                op_opt = op;
-                if end {
+                    .await?
+                {
                     return Ok(acp::PromptResponse {
                         stop_reason: acp::StopReason::EndTurn,
                         meta: None,
                     });
                 }
+
+                op_opt = self
+                    .handle_background_task_command(&args.session_id, &name)
+                    .await?;
             }
         }
 
@@ -830,18 +833,8 @@ impl Agent for CodexAgent {
                         raw_output: None,
                         meta: None,
                     };
-                    let (tx, rx) = oneshot::channel();
-                    self.session_update_tx
-                        .send((
-                            acp::SessionNotification {
-                                session_id: args.session_id.clone(),
-                                update: acp::SessionUpdate::ToolCall(tool),
-                                meta: None,
-                            },
-                            tx,
-                        ))
-                        .map_err(Error::into_internal_error)?;
-                    let _ = rx.await;
+                    self.send_session_update(&args.session_id, acp::SessionUpdate::ToolCall(tool))
+                        .await?;
                 }
                 EventMsg::McpToolCallEnd(end) => {
                     // status and optional output
@@ -867,18 +860,11 @@ impl Agent for CodexAgent {
                         },
                         meta: None,
                     };
-                    let (tx, rx) = oneshot::channel();
-                    self.session_update_tx
-                        .send((
-                            acp::SessionNotification {
-                                session_id: args.session_id.clone(),
-                                update: acp::SessionUpdate::ToolCallUpdate(update),
-                                meta: None,
-                            },
-                            tx,
-                        ))
-                        .map_err(Error::into_internal_error)?;
-                    let _ = rx.await;
+                    self.send_session_update(
+                        &args.session_id,
+                        acp::SessionUpdate::ToolCallUpdate(update),
+                    )
+                    .await?;
                 }
                 // Exec command begin/end → ACP ToolCall/ToolCallUpdate
                 EventMsg::ExecCommandBegin(beg) => {
@@ -897,18 +883,8 @@ impl Agent for CodexAgent {
                         raw_output: None,
                         meta: None,
                     };
-                    let (tx, rx) = oneshot::channel();
-                    self.session_update_tx
-                        .send((
-                            acp::SessionNotification {
-                                session_id: args.session_id.clone(),
-                                update: acp::SessionUpdate::ToolCall(tool),
-                                meta: None,
-                            },
-                            tx,
-                        ))
-                        .map_err(Error::into_internal_error)?;
-                    let _ = rx.await;
+                    self.send_session_update(&args.session_id, acp::SessionUpdate::ToolCall(tool))
+                        .await?;
                 }
                 EventMsg::ExecCommandEnd(end) => {
                     let status = if end.exit_code == 0 {
@@ -949,18 +925,11 @@ impl Agent for CodexAgent {
                         },
                         meta: None,
                     };
-                    let (tx, rx) = oneshot::channel();
-                    self.session_update_tx
-                        .send((
-                            acp::SessionNotification {
-                                session_id: args.session_id.clone(),
-                                update: acp::SessionUpdate::ToolCallUpdate(update),
-                                meta: None,
-                            },
-                            tx,
-                        ))
-                        .map_err(Error::into_internal_error)?;
-                    let _ = rx.await;
+                    self.send_session_update(
+                        &args.session_id,
+                        acp::SessionUpdate::ToolCallUpdate(update),
+                    )
+                    .await?;
                 }
                 EventMsg::ExecApprovalRequest(req) => {
                     // Build a ToolCallUpdate describing the pending exec
@@ -1103,18 +1072,11 @@ impl Agent for CodexAgent {
                         meta: None,
                     };
 
-                    let (tx, rx) = oneshot::channel();
-                    self.session_update_tx
-                        .send((
-                            acp::SessionNotification {
-                                session_id: args.session_id.clone(),
-                                update: acp::SessionUpdate::ToolCallUpdate(update),
-                                meta: None,
-                            },
-                            tx,
-                        ))
-                        .map_err(Error::into_internal_error)?;
-                    rx.await.map_err(Error::into_internal_error)?;
+                    self.send_session_update(
+                        &args.session_id,
+                        acp::SessionUpdate::ToolCallUpdate(update),
+                    )
+                    .await?;
                 }
                 EventMsg::TokenCount(tc) => {
                     if let Some(info) = tc.info {
@@ -1147,21 +1109,14 @@ impl Agent for CodexAgent {
                         })
                         .collect();
 
-                    let (tx, rx) = oneshot::channel();
-                    self.session_update_tx
-                        .send((
-                            acp::SessionNotification {
-                                session_id: args.session_id.clone(),
-                                update: acp::SessionUpdate::Plan(acp::Plan {
-                                    entries,
-                                    meta: None,
-                                }),
-                                meta: None,
-                            },
-                            tx,
-                        ))
-                        .map_err(Error::into_internal_error)?;
-                    let _ = rx.await;
+                    self.send_session_update(
+                        &args.session_id,
+                        acp::SessionUpdate::Plan(acp::Plan {
+                            entries,
+                            meta: None,
+                        }),
+                    )
+                    .await?;
                 }
                 EventMsg::TaskComplete(_) => {
                     break acp::StopReason::EndTurn;

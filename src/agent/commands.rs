@@ -16,7 +16,7 @@ impl CodexAgent {
         session_id: &acp::SessionId,
         name: &str,
         _rest: &str,
-    ) -> Result<(Option<Op>, bool), Error> {
+    ) -> Result<bool, Error> {
         let conversation = self.get_conversation(session_id).await?;
 
         // Commands implemented inline (no Codex submission needed)
@@ -39,7 +39,7 @@ impl CodexAgent {
                             format!("Failed to start new conversation: {}", e).into(),
                         )
                         .await?;
-                        return Ok((None, true));
+                        return Ok(true);
                     }
                 };
 
@@ -55,7 +55,6 @@ impl CodexAgent {
                     conversation_id.to_string(),
                     SessionState {
                         fs_session_id,
-                        conversation_id: conversation_id.to_string(),
                         conversation: Some(conversation.clone()),
                         current_approval: self.config.approval_policy,
                         current_sandbox: self.config.sandbox_policy.clone(),
@@ -68,13 +67,13 @@ impl CodexAgent {
 
                 self.send_message_chunk(session_id, "✨ Started a new conversation".into())
                     .await?;
-                return Ok((None, true));
+                return Ok(true);
             }
             "status" => {
                 let status_text = self.render_status(session_id).await;
                 self.send_message_chunk(session_id, status_text.into())
                     .await?;
-                return Ok((None, true));
+                return Ok(true);
             }
             "model" => {
                 let rest = _rest.trim();
@@ -84,7 +83,7 @@ impl CodexAgent {
                         self.config.model,
                     );
                     self.send_message_chunk(session_id, msg.into()).await?;
-                    return Ok((None, true));
+                    return Ok(true);
                 }
 
                 // Request Codex to change the model for subsequent turns.
@@ -108,7 +107,7 @@ impl CodexAgent {
                     format!("🧠 Requested model change to: `{}`", rest).into(),
                 )
                 .await?;
-                return Ok((None, true));
+                return Ok(true);
             }
             "approvals" => {
                 let mode = _rest.trim().to_lowercase();
@@ -117,7 +116,7 @@ impl CodexAgent {
                 if !allowed.contains(&mode.as_str()) {
                     let msg = format!("Usage: /approvals {}", allowed.join("|"));
                     self.send_message_chunk(session_id, msg.into()).await?;
-                    return Ok((None, true));
+                    return Ok(true);
                 }
 
                 let preset = APPROVAL_PRESETS
@@ -142,7 +141,7 @@ impl CodexAgent {
                         format!("⚠️ Failed to set approval policy: {}", e).into(),
                     )
                     .await?;
-                    return Ok((None, true));
+                    return Ok(true);
                 }
 
                 // Persist our local view of the policy for /status
@@ -166,7 +165,7 @@ impl CodexAgent {
                     ))
                     .map_err(Error::into_internal_error)?;
                 rx.await.map_err(Error::into_internal_error)?;
-                return Ok((None, true));
+                return Ok(true);
             }
             "quit" => {
                 // Say goodbye and submit Shutdown to Codex if available
@@ -178,57 +177,29 @@ impl CodexAgent {
 
                 // Send the goodbye message
                 self.send_message_chunk(session_id, quit_msg.into()).await?;
-                return Ok((None, true));
+                return Ok(true);
             }
             _ => {}
+        }
+
+        Ok(false)
+    }
+
+    pub async fn handle_background_task_command(
+        &self,
+        session_id: &acp::SessionId,
+        name: &str,
+    ) -> Result<Option<Op>, Error> {
+        if !matches!(name, "init" | "review" | "compact") {
+            return Ok(None);
         }
 
         let mut msg = String::default();
         // Commands forwarded to Codex as protocol Ops
         let op = match name {
             "init" => {
-                let prompt = r#"
-Generate a file named AGENTS.md that serves as a contributor guide for this repository.
-Your goal is to produce a clear, concise, and well-structured document with descriptive headings and actionable explanations for each section.
-Follow the outline below, but adapt as needed — add sections if relevant, and omit those that do not apply to this project.
+                let prompt = include_str!("./prompt_init_command.md");
 
-Document Requirements
-
-- Title the document "Repository Guidelines".
-- Use Markdown headings (#, ##, etc.) for structure.
-- Keep the document concise. 200-400 words is optimal.
-- Keep explanations short, direct, and specific to this repository.
-- Provide examples where helpful (commands, directory paths, naming patterns).
-- Maintain a professional, instructional tone.
-
-Recommended Sections
-
-Project Structure & Module Organization
-
-- Outline the project structure, including where the source code, tests, and assets are located.
-
-Build, Test, and Development Commands
-
-- List key commands for building, testing, and running locally (e.g., npm test, make build).
-- Briefly explain what each command does.
-
-Coding Style & Naming Conventions
-
-- Specify indentation rules, language-specific style preferences, and naming patterns.
-- Include any formatting or linting tools used.
-
-Testing Guidelines
-
-- Identify testing frameworks and coverage requirements.
-- State test naming conventions and how to run tests.
-
-Commit & Pull Request Guidelines
-
-- Summarize commit message conventions found in the project’s Git history.
-- Outline pull request requirements (descriptions, linked issues, screenshots, etc.).
-
-(Optional) Add other sections if relevant, such as Security & Configuration Tips, Architecture Overview, or Agent-Specific Instructions.
-"#;
                 msg = "📝 Creating AGENTS.md file with initial instructions...\n\n".into();
                 Some(Op::UserInput {
                     items: vec![InputItem::Text {
@@ -258,8 +229,7 @@ Commit & Pull Request Guidelines
         if !msg.is_empty() {
             self.send_message_chunk(session_id, msg.into()).await?;
         }
-
-        Ok((op, false))
+        Ok(op)
     }
 
     async fn render_status(&self, session_id: &acp::SessionId) -> String {

@@ -93,6 +93,16 @@ When a session starts, `codex-acp` spins up an in-process TCP bridge and registe
 
 `codex-acp` also injects a default instruction reminding the model to use these tools rather than shelling out with `cat`/`tee`. If your client exposes filesystem capabilities, file access stays within ACP.
 
+## Plan Updates
+
+When Codex emits plan updates (step lists with statuses), the agent translates them into ACP `SessionUpdate::Plan` events. Clients receive structured plan entries with status mapping:
+
+- Pending → `pending`
+- InProgress → `in_progress`
+- Completed → `completed`
+
+The agent preserves ordering and includes any optional explanation text. This allows IDEs to render a live task checklist during long-running operations.
+
 ## Features
 
 - ACP Agent implementation
@@ -102,12 +112,12 @@ When a session starts, `codex-acp` spins up an in-process TCP bridge and registe
 - Slash commands (advertised via `AvailableCommandsUpdate`)
   - Implemented today:
     - `/new` — Start a new chat during a conversation.
-    - `/init` - Create an AGENTS.md file with instructions for Codex
+    - `/init` — Create an `AGENTS.md` with repository contributor guidance. Uses a bundled prompt (`src/agent/prompt_init_command.md`).
     - `/model` — Show or set the current model (uses `Op::OverrideTurnContext`).
     - `/approvals` — Set approval mode (`ready-only | auto | full-access`).
     - `/status` — Rich status (workspace, account, model, token usage).
-    - `/compact` — Summarize conversation to prevent hitting the context limit.
-    - `/review` — Review current changes and find issues.
+    - `/compact` — Request Codex to compact/summarize the conversation to reduce context size.
+    - `/review` — Ask Codex to review current changes, highlight issues, and suggest fixes.
     - `/quit` — Exit Codex agent. Shows a goodbye message and requests backend shutdown if available.
 
 - Session modes
