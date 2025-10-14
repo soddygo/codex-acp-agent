@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
-use agent_client_protocol::{self as acp, Agent, Error, PlanEntry, V1};
+use agent_client_protocol::{self as acp, Agent, Error, McpServer, PlanEntry, V1};
 use codex_app_server_protocol::AuthMode;
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
@@ -158,7 +158,97 @@ impl CodexAgent {
         })
     }
 
-    fn build_session_config(&self, session_id: &str) -> Result<CodexConfig, Error> {
+    fn extract_bearer_token(headers: &[acp::HttpHeader]) -> Option<String> {
+        headers.iter().find_map(|header| {
+            header
+                .name
+                .eq_ignore_ascii_case("Authorization")
+                .then(|| {
+                    header
+                        .value
+                        .trim()
+                        .strip_prefix("Bearer ")
+                        .map(|token| token.trim().to_owned())
+                })
+                .flatten()
+        })
+    }
+
+    fn build_streamable_http_server(
+        name: String,
+        url: String,
+        headers: Vec<acp::HttpHeader>,
+        startup_timeout: Option<Duration>,
+        tool_timeout: Option<Duration>,
+    ) -> (String, McpServerConfig) {
+        let bearer_token = Self::extract_bearer_token(&headers);
+        (
+            name,
+            McpServerConfig {
+                transport: McpServerTransportConfig::StreamableHttp {
+                    url,
+                    bearer_token_env_var: bearer_token,
+                },
+                enabled: true,
+                startup_timeout_sec: startup_timeout,
+                tool_timeout_sec: tool_timeout,
+            },
+        )
+    }
+
+    fn build_mcp_server(
+        &self,
+        server: McpServer,
+        startup_timeout: Option<Duration>,
+        tool_timeout: Option<Duration>,
+    ) -> Option<(String, McpServerConfig)> {
+        match server {
+            McpServer::Http { name, url, headers } | McpServer::Sse { name, url, headers } => {
+                Some(Self::build_streamable_http_server(
+                    name,
+                    url.to_string(),
+                    headers,
+                    startup_timeout,
+                    tool_timeout,
+                ))
+            }
+            McpServer::Stdio {
+                name,
+                command,
+                args,
+                env,
+            } => {
+                let env = if env.is_empty() {
+                    None
+                } else {
+                    Some(
+                        env.into_iter()
+                            .map(|var| (var.name, var.value))
+                            .collect::<HashMap<_, _>>(),
+                    )
+                };
+                Some((
+                    name,
+                    McpServerConfig {
+                        transport: McpServerTransportConfig::Stdio {
+                            command: command.to_string_lossy().into_owned(),
+                            args,
+                            env,
+                        },
+                        enabled: true,
+                        startup_timeout_sec: startup_timeout,
+                        tool_timeout_sec: tool_timeout,
+                    },
+                ))
+            }
+        }
+    }
+
+    fn build_session_config(
+        &self,
+        session_id: &str,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<CodexConfig, Error> {
         let mut session_config = self.config.clone();
         let fs_guidance = include_str!("./prompt_fs_guidance.md");
 
@@ -184,6 +274,15 @@ impl CodexAgent {
                 None => Some(fs_guidance.to_string()),
             };
         }
+
+        let startup_timeout = Some(Duration::from_secs(5));
+        let tool_timeout = Some(Duration::from_secs(30));
+
+        session_config.mcp_servers.extend(
+            mcp_servers
+                .into_iter()
+                .filter_map(|srv| self.build_mcp_server(srv, startup_timeout, tool_timeout)),
+        );
 
         if let Some(bridge) = &self.fs_bridge {
             let server_config = self.prepare_fs_mcp_server_config(session_id, bridge.as_ref())?;
@@ -553,7 +652,7 @@ impl Agent for CodexAgent {
             .map(|m| m.current_mode_id.clone())
             .unwrap_or(acp::SessionModeId("auto".into()));
 
-        let session_config = self.build_session_config(&fs_session_id)?;
+        let session_config = self.build_session_config(&fs_session_id, args.mcp_servers)?;
 
         let new_conv = self
             .conversation_manager
@@ -621,8 +720,28 @@ impl Agent for CodexAgent {
         args: acp::LoadSessionRequest,
     ) -> Result<acp::LoadSessionResponse, Error> {
         info!(?args, "Received load session request");
+        let current_mode = {
+            let sessions = self.sessions.borrow();
+            let state = sessions
+                .get(args.session_id.0.as_ref())
+                .ok_or_else(|| Error::invalid_params().with_data("session not found"))?;
+            state.current_mode.clone()
+        };
+
         Ok(acp::LoadSessionResponse {
-            modes: None,
+            modes: Some(acp::SessionModeState {
+                current_mode_id: current_mode,
+                available_modes: APPROVAL_PRESETS
+                    .iter()
+                    .map(|preset| acp::SessionMode {
+                        id: acp::SessionModeId(preset.id.into()),
+                        name: preset.label.to_owned(),
+                        description: Some(preset.description.to_owned()),
+                        meta: None,
+                    })
+                    .collect(),
+                meta: None,
+            }),
             meta: None,
         })
     }
@@ -635,7 +754,7 @@ impl Agent for CodexAgent {
         let preset = APPROVAL_PRESETS
             .iter()
             .find(|preset| args.mode_id.0.as_ref() == preset.id)
-            .ok_or_else(Error::invalid_params)?;
+            .ok_or_else(|| Error::invalid_params().with_data("invalid mode id"))?;
 
         self.get_conversation(&args.session_id)
             .await?
@@ -683,7 +802,7 @@ impl Agent for CodexAgent {
 
                 op_opt = self
                     .handle_background_task_command(&args.session_id, &name)
-                    .await?;
+                    .await;
             }
         }
 

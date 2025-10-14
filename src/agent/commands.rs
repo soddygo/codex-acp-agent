@@ -5,7 +5,6 @@ use codex_core::{
     protocol::{AskForApproval, Op, ReviewRequest, SandboxPolicy},
 };
 use std::sync::LazyLock;
-use std::{fs, io};
 use tokio::sync::oneshot;
 
 pub static AVAILABLE_COMMANDS: LazyLock<Vec<AvailableCommand>> = LazyLock::new(built_in_commands);
@@ -15,183 +14,188 @@ impl CodexAgent {
         &self,
         session_id: &acp::SessionId,
         name: &str,
-        _rest: &str,
+        rest: &str,
     ) -> Result<bool, Error> {
-        let conversation = self.get_conversation(session_id).await?;
-
-        // Commands implemented inline (no Codex submission needed)
         match name {
-            "new" => {
-                // Start a new conversation within the current session
-                let (conversation_id, conversation) = match self
-                    .conversation_manager
-                    .new_conversation(self.config.clone())
-                    .await
-                {
-                    Ok(NewConversation {
-                        conversation_id,
-                        conversation,
-                        ..
-                    }) => (conversation_id, conversation),
-                    Err(e) => {
-                        self.send_message_chunk(
-                            session_id,
-                            format!("Failed to start new conversation: {}", e).into(),
-                        )
-                        .await?;
-                        return Ok(true);
-                    }
-                };
+            "new" => self.handle_new_cmd(session_id).await,
+            "status" => self.handle_status_cmd(session_id).await,
+            "model" => self.handle_model_cmd(session_id, rest).await,
+            "approvals" => self.handle_approvals_cmd(session_id, rest).await,
+            "quit" => self.handle_quit_cmd(session_id).await,
+            _ => Ok(false),
+        }
+    }
 
-                let current_mode = Self::modes(&self.config)
-                    .as_ref()
-                    .map(|m| m.current_mode_id.clone())
-                    .unwrap_or(acp::SessionModeId("auto".into()));
-
-                let fs_session_id = Uuid::new_v4().to_string();
-
-                // Update the session with the new conversation
-                self.sessions.borrow_mut().insert(
-                    conversation_id.to_string(),
-                    SessionState {
-                        fs_session_id,
-                        conversation: Some(conversation.clone()),
-                        current_approval: self.config.approval_policy,
-                        current_sandbox: self.config.sandbox_policy.clone(),
-                        current_mode,
-                        token_usage: None,
-                        reasoning_sections: Vec::new(),
-                        current_reasoning_chunk: String::new(),
-                    },
-                );
-
-                self.send_message_chunk(session_id, "✨ Started a new conversation".into())
-                    .await?;
-                return Ok(true);
-            }
-            "status" => {
-                let status_text = self.render_status(session_id).await;
-                self.send_message_chunk(session_id, status_text.into())
-                    .await?;
-                return Ok(true);
-            }
-            "model" => {
-                let rest = _rest.trim();
-                if rest.is_empty() {
-                    let msg = format!(
-                        "Current model: {}\nUsage: /model <model-slug>",
-                        self.config.model,
-                    );
-                    self.send_message_chunk(session_id, msg.into()).await?;
-                    return Ok(true);
-                }
-
-                // Request Codex to change the model for subsequent turns.
-                let op = Op::OverrideTurnContext {
-                    cwd: None,
-                    approval_policy: None,
-                    sandbox_policy: None,
-                    model: Some(rest.to_string()),
-                    effort: None,
-                    summary: None,
-                };
-
-                conversation
-                    .submit(op)
-                    .await
-                    .map_err(Error::into_internal_error)?;
-
-                // Provide immediate feedback to the user.
+    async fn handle_new_cmd(&self, session_id: &acp::SessionId) -> Result<bool, Error> {
+        let (conversation_id, conversation) = match self
+            .conversation_manager
+            .new_conversation(self.config.clone())
+            .await
+        {
+            Ok(NewConversation {
+                conversation_id,
+                conversation,
+                ..
+            }) => (conversation_id, conversation),
+            Err(e) => {
                 self.send_message_chunk(
                     session_id,
-                    format!("🧠 Requested model change to: `{}`", rest).into(),
+                    format!("Failed to start new conversation: {}", e).into(),
                 )
                 .await?;
                 return Ok(true);
             }
-            "approvals" => {
-                let mode = _rest.trim().to_lowercase();
-                let allowed = ["read-only", "auto", "full-access"];
+        };
 
-                if !allowed.contains(&mode.as_str()) {
-                    let msg = format!("Usage: /approvals {}", allowed.join("|"));
-                    self.send_message_chunk(session_id, msg.into()).await?;
-                    return Ok(true);
-                }
+        let current_mode = Self::modes(&self.config)
+            .as_ref()
+            .map(|m| m.current_mode_id.clone())
+            .unwrap_or(acp::SessionModeId("auto".into()));
 
-                let preset = APPROVAL_PRESETS
-                    .iter()
-                    .find(|preset| mode == preset.id)
-                    .ok_or_else(Error::invalid_params)?;
+        let fs_session_id = Uuid::new_v4().to_string();
+        self.sessions.borrow_mut().insert(
+            conversation_id.to_string(),
+            SessionState {
+                fs_session_id,
+                conversation: Some(conversation.clone()),
+                current_approval: self.config.approval_policy,
+                current_sandbox: self.config.sandbox_policy.clone(),
+                current_mode,
+                token_usage: None,
+                reasoning_sections: Vec::new(),
+                current_reasoning_chunk: String::new(),
+            },
+        );
 
-                let submit_result = conversation
-                    .submit(Op::OverrideTurnContext {
-                        cwd: None,
-                        approval_policy: Some(preset.approval),
-                        sandbox_policy: Some(preset.sandbox.clone()),
-                        model: None,
-                        effort: None,
-                        summary: None,
-                    })
-                    .await;
+        self.send_message_chunk(session_id, "✨ Started a new conversation".into())
+            .await?;
+        Ok(true)
+    }
 
-                if let Err(e) = submit_result {
-                    self.send_message_chunk(
-                        session_id,
-                        format!("⚠️ Failed to set approval policy: {}", e).into(),
-                    )
-                    .await?;
-                    return Ok(true);
-                }
+    async fn handle_status_cmd(&self, session_id: &acp::SessionId) -> Result<bool, Error> {
+        let status_text = self.render_status(session_id).await;
+        self.send_message_chunk(session_id, status_text.into())
+            .await?;
+        Ok(true)
+    }
 
-                // Persist our local view of the policy for /status
-                self.with_session_state_mut(session_id, |state| {
-                    state.current_approval = preset.approval;
-                    state.current_sandbox = preset.sandbox.clone();
-                    state.current_mode = acp::SessionModeId(preset.id.into());
-                });
-
-                let (tx, rx) = oneshot::channel();
-                self.session_update_tx
-                    .send((
-                        acp::SessionNotification {
-                            session_id: session_id.clone(),
-                            update: acp::SessionUpdate::CurrentModeUpdate {
-                                current_mode_id: acp::SessionModeId(preset.id.into()),
-                            },
-                            meta: None,
-                        },
-                        tx,
-                    ))
-                    .map_err(Error::into_internal_error)?;
-                rx.await.map_err(Error::into_internal_error)?;
-                return Ok(true);
-            }
-            "quit" => {
-                // Say goodbye and submit Shutdown to Codex if available
-                let mut quit_msg = "👋 Codex agent is shutting down. Goodbye!".into();
-                // Request backend shutdown
-                if let Err(e) = conversation.submit(Op::Shutdown).await {
-                    quit_msg = format!("Failed to submit shutdown: {}", e);
-                }
-
-                // Send the goodbye message
-                self.send_message_chunk(session_id, quit_msg.into()).await?;
-                return Ok(true);
-            }
-            _ => {}
+    async fn handle_model_cmd(
+        &self,
+        session_id: &acp::SessionId,
+        rest: &str,
+    ) -> Result<bool, Error> {
+        let trimmed = rest.trim();
+        if trimmed.is_empty() {
+            let msg = format!(
+                "Current model: {}\nUsage: /model <model-slug>",
+                self.config.model,
+            );
+            self.send_message_chunk(session_id, msg.into()).await?;
+            return Ok(true);
         }
 
-        Ok(false)
+        let conversation = self.get_conversation(session_id).await?;
+        conversation
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                model: Some(trimmed.to_string()),
+                effort: None,
+                summary: None,
+            })
+            .await
+            .map_err(Error::into_internal_error)?;
+
+        self.send_message_chunk(
+            session_id,
+            format!("🧠 Requested model change to: `{}`", trimmed).into(),
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn handle_approvals_cmd(
+        &self,
+        session_id: &acp::SessionId,
+        rest: &str,
+    ) -> Result<bool, Error> {
+        const APPROVAL_MODES: [&str; 3] = ["read-only", "auto", "full-access"];
+        let mode = rest.trim().to_lowercase();
+
+        if !APPROVAL_MODES.contains(&mode.as_str()) {
+            let msg = format!("Usage: /approvals {}", APPROVAL_MODES.join("|"));
+            self.send_message_chunk(session_id, msg.into()).await?;
+            return Ok(true);
+        }
+
+        let preset = APPROVAL_PRESETS
+            .iter()
+            .find(|preset| mode == preset.id)
+            .ok_or_else(Error::invalid_params)?;
+
+        let conversation = self.get_conversation(session_id).await?;
+        if let Err(e) = conversation
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: Some(preset.approval),
+                sandbox_policy: Some(preset.sandbox.clone()),
+                model: None,
+                effort: None,
+                summary: None,
+            })
+            .await
+        {
+            self.send_message_chunk(
+                session_id,
+                format!("⚠️ Failed to set approval policy: {}", e).into(),
+            )
+            .await?;
+            return Ok(true);
+        }
+
+        self.with_session_state_mut(session_id, |state| {
+            state.current_approval = preset.approval;
+            state.current_sandbox = preset.sandbox.clone();
+            state.current_mode = acp::SessionModeId(preset.id.into());
+        });
+
+        let (tx, rx) = oneshot::channel();
+        self.session_update_tx
+            .send((
+                acp::SessionNotification {
+                    session_id: session_id.clone(),
+                    update: acp::SessionUpdate::CurrentModeUpdate {
+                        current_mode_id: acp::SessionModeId(preset.id.into()),
+                    },
+                    meta: None,
+                },
+                tx,
+            ))
+            .map_err(Error::into_internal_error)?;
+        rx.await.map_err(Error::into_internal_error)?;
+        Ok(true)
+    }
+
+    async fn handle_quit_cmd(&self, session_id: &acp::SessionId) -> Result<bool, Error> {
+        let conversation = self.get_conversation(session_id).await?;
+        let mut quit_msg = "👋 Codex agent is shutting down. Goodbye!".to_string();
+
+        if let Err(e) = conversation.submit(Op::Shutdown).await {
+            quit_msg = format!("Failed to submit shutdown: {}", e);
+        }
+
+        self.send_message_chunk(session_id, quit_msg.into()).await?;
+        Ok(true)
     }
 
     pub async fn handle_background_task_command(
         &self,
         session_id: &acp::SessionId,
         name: &str,
-    ) -> Result<Option<Op>, Error> {
+    ) -> Option<Op> {
         if !matches!(name, "init" | "review" | "compact") {
-            return Ok(None);
+            return None;
         }
 
         let mut msg = String::default();
@@ -227,9 +231,9 @@ impl CodexAgent {
         };
 
         if !msg.is_empty() {
-            self.send_message_chunk(session_id, msg.into()).await?;
+            drop(self.send_message_chunk(session_id, msg.into()).await);
         }
-        Ok(op)
+        op
     }
 
     async fn render_status(&self, session_id: &acp::SessionId) -> String {
@@ -403,11 +407,6 @@ impl CodexAgent {
         self.client_capabilities.borrow().fs.read_text_file
     }
 
-    #[allow(dead_code)]
-    fn client_supports_fs_write(&self) -> bool {
-        self.client_capabilities.borrow().fs.write_text_file
-    }
-
     async fn client_read_text_file(
         &self,
         session_id: &acp::SessionId,
@@ -431,39 +430,6 @@ impl CodexAgent {
         rx.await.map_err(|_| {
             Error::internal_error().with_data("client read_text_file response dropped")
         })?
-    }
-
-    #[allow(dead_code)]
-    async fn client_write_text_file(
-        &self,
-        session_id: &acp::SessionId,
-        path: PathBuf,
-        content: String,
-    ) -> Result<(), Error> {
-        let (tx, rx) = oneshot::channel();
-        let request = acp::WriteTextFileRequest {
-            session_id: session_id.clone(),
-            path,
-            content,
-            meta: None,
-        };
-        self.client_tx
-            .send(ClientOp::WriteTextFile(request, tx))
-            .map_err(|_| {
-                Error::internal_error().with_data("client write_text_file channel closed")
-            })?;
-        let response = rx.await.map_err(|_| {
-            Error::internal_error().with_data("client write_text_file response dropped")
-        })?;
-        response.map(|_| ())
-    }
-
-    #[allow(dead_code)]
-    fn write_text_file_locally(&self, path: &Path, content: &str) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, content)
     }
 
     fn title_case(&self, s: &str) -> String {
