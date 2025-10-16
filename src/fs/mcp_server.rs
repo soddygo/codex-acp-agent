@@ -1,22 +1,35 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use super::bridge;
 
 use anyhow::{Context, Result, anyhow};
 use diffy::{PatchFormatter, create_patch};
-use serde::Deserialize;
+use rmcp::{
+    ErrorData as McpError, ServerHandler,
+    handler::server::{tool::ToolRouter, wrapper::Parameters},
+    model::{
+        AnnotateAble, CallToolResult, Content, Implementation, Meta, ProtocolVersion, RawContent,
+        RawTextContent, ServerCapabilities, ServerInfo,
+    },
+    service, tool, tool_handler, tool_router,
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::TcpStream;
-use tokio::time::{Duration, timeout};
-
-use super::bridge;
-use mcp_types::MCP_SCHEMA_VERSION;
+use std::collections::HashMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::TcpStream,
+    time::{Duration, timeout},
+};
 use tracing::info;
-
-static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_READ_LINE_LIMIT: u32 = 1000;
 const MAX_READ_BYTES: usize = 50 * 1024;
+
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LineRange {
@@ -35,316 +48,281 @@ struct ReadSnippet {
     bytes_returned: usize,
 }
 
-#[derive(Default)]
-struct StagedEdits {
-    entries: HashMap<String, StagedFile>,
+pub async fn run() -> Result<()> {
+    // Capture required env to talk to our local bridge and session.
+    let bridge_addr = std::env::var("ACP_FS_BRIDGE_ADDR")
+        .context("ACP_FS_BRIDGE_ADDR environment variable is required")?;
+    let session_id = std::env::var("ACP_FS_SESSION_ID")
+        .context("ACP_FS_SESSION_ID environment variable is required")?;
+
+    // Build an rmcp server over stdio with our tools.
+    let server = FsTools::new(bridge_addr, session_id);
+    let transport = rmcp::transport::io::stdio();
+    // Serve and wait until the client closes the connection.
+    let running = service::serve_server(server, transport).await?;
+    let _ = running.waiting().await; // ignore quit reason
+    Ok(())
 }
 
+// In-memory staging of edits to allow applying multi-step changes coherently.
+#[derive(Default, Clone)]
+struct StagedEdits {
+    entries: Arc<tokio::sync::Mutex<HashMap<String, StagedFile>>>,
+}
+
+#[derive(Clone)]
 struct StagedFile {
     content: String,
 }
 
 impl StagedEdits {
-    fn stage(&mut self, path: String, content: String) {
-        self.entries.insert(path, StagedFile { content });
+    async fn stage(&self, path: String, content: String) {
+        let mut map = self.entries.lock().await;
+        map.insert(path, StagedFile { content });
     }
-
-    fn get(&self, path: &str) -> Option<&StagedFile> {
-        self.entries.get(path)
+    async fn get(&self, path: &str) -> Option<StagedFile> {
+        let map = self.entries.lock().await;
+        map.get(path).cloned()
     }
 }
 
-pub async fn run() -> Result<()> {
-    let bridge_addr = std::env::var("ACP_FS_BRIDGE_ADDR")
-        .context("ACP_FS_BRIDGE_ADDR environment variable is required")?;
-    let session_id = std::env::var("ACP_FS_SESSION_ID")
-        .context("ACP_FS_SESSION_ID environment variable is required")?;
-    serve_loop(&bridge_addr, session_id).await
+#[derive(Clone)]
+struct FsTools {
+    bridge_addr: String,
+    session_id: String,
+    staged_edits: StagedEdits,
+    tool_router: ToolRouter<Self>,
 }
 
-async fn serve_loop(bridge_addr: &str, session_id: String) -> Result<()> {
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin).lines();
-    let stdout = tokio::io::stdout();
-    let mut writer = BufWriter::new(stdout);
-    let mut staged_edits = StagedEdits::default();
-
-    while let Some(line) = reader.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let msg: serde_json::Value = serde_json::from_str(&line)?;
-        let method = msg.get("method").and_then(|m| m.as_str());
-        let id = msg.get("id").cloned();
-
-        match method {
-            Some("initialize") => {
-                let response = json!({
-                    "jsonrpc": "2.0",
-                    "id": id.clone().unwrap_or(json!(null)),
-                    "result": {
-                        "capabilities": {
-                            "tools": {
-                                "listChanged": true
-                            }
-                        },
-                        "serverInfo": {
-                            "name": "codex-acp-fs",
-                            "title": "Codex ACP Filesystem",
-                            "version": env!("CARGO_PKG_VERSION"),
-                        },
-                    "protocolVersion": MCP_SCHEMA_VERSION,
-                    }
-                });
-                write_message(&mut writer, response).await?;
-
-                let notification = json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/initialized",
-                    "params": null
-                });
-                write_message(&mut writer, notification).await?;
-            }
-            Some("ping") => {
-                let response = json!({
-                    "jsonrpc": "2.0",
-                    "id": id.clone().unwrap_or(json!(null)),
-                    "result": {}
-                });
-                write_message(&mut writer, response).await?;
-            }
-            Some("tools/list") => {
-                let response = json!({
-                    "jsonrpc": "2.0",
-                    "id": id.clone().unwrap_or(json!(null)),
-                    "result": {
-                        "tools": [
-                            read_tool_definition(),
-                            write_tool_definition(),
-                            edit_tool_definition(),
-                            multi_edit_tool_definition(),
-                        ]
-                    }
-                });
-                write_message(&mut writer, response).await?;
-            }
-            Some("tools/call") => {
-                let result =
-                    handle_tool_call(bridge_addr, &session_id, &msg, &mut staged_edits).await;
-                match result {
-                    Ok(value) => {
-                        let response = json!({
-                            "jsonrpc": "2.0",
-                            "id": id.clone().unwrap_or(json!(null)),
-                            "result": value
-                        });
-                        write_message(&mut writer, response).await?;
-                    }
-                    Err(err) => {
-                        let response = json!({
-                            "jsonrpc": "2.0",
-                            "id": id.clone().unwrap_or(json!(null)),
-                            "error": {
-                                "code": -32001,
-                                "message": err.to_string(),
-                            }
-                        });
-                        write_message(&mut writer, response).await?;
-                    }
-                }
-            }
-            _ => {
-                if let Some(id_value) = id {
-                    let response = json!({
-                        "jsonrpc": "2.0",
-                        "id": id_value,
-                        "error": {
-                            "code": -32601,
-                            "message": "method not found"
-                        }
-                    });
-                    write_message(&mut writer, response).await?;
-                }
-            }
+impl FsTools {
+    fn new(bridge_addr: String, session_id: String) -> Self {
+        Self {
+            bridge_addr,
+            session_id,
+            staged_edits: Default::default(),
+            tool_router: Self::tool_router(),
         }
     }
-
-    writer.flush().await?;
-    Ok(())
 }
 
-async fn handle_tool_call(
-    bridge_addr: &str,
-    session_id: &str,
-    message: &serde_json::Value,
-    staged_edits: &mut StagedEdits,
-) -> Result<serde_json::Value> {
-    let params = message
-        .get("params")
-        .and_then(|p| p.get("arguments"))
-        .cloned()
-        .ok_or_else(|| anyhow!("missing tool call arguments"))?;
+#[tool_router]
+impl FsTools {
+    /// Read workspace files via ACP bridge (paged to ~1000 lines/50KB; use line/limit to continue).
+    #[tool(
+        description = "Read workspace files via ACP bridge (paged to ~1000 lines/50KB; use line/limit to continue)."
+    )]
+    async fn read_text_file(
+        &self,
+        Parameters(ReadTextFileArgs { path, line, limit }): Parameters<ReadTextFileArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let start_line = line.unwrap_or(1).max(1);
+        let requested_limit = limit
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_READ_LINE_LIMIT);
+        let bridge_limit = requested_limit.saturating_add(1);
+        let response = perform_bridge_request(
+            &self.bridge_addr,
+            &self.session_id,
+            bridge::BridgeOp::Read,
+            &path,
+            line,
+            Some(bridge_limit),
+            None,
+        )
+        .await
+        .map_err(|e| {
+            McpError::internal_error("bridge read failed", Some(json!({"reason": e.to_string()})))
+        })?;
 
-    let name = message
-        .get("params")
-        .and_then(|p| p.get("name"))
-        .and_then(|n| n.as_str())
-        .unwrap_or_default();
+        let mut snippet =
+            prepare_read_snippet(&response, start_line, requested_limit, MAX_READ_BYTES);
 
-    match name {
-        "read_text_file" => {
-            let ReadTextFileArgs { path, line, limit } = serde_json::from_value(params.clone())?;
-            let start_line = line.unwrap_or(1).max(1);
-            let requested_limit = limit
-                .filter(|value| *value > 0)
-                .unwrap_or(DEFAULT_READ_LINE_LIMIT);
-            let bridge_limit = requested_limit.saturating_add(1);
-            let response = perform_bridge_request(
-                bridge_addr,
-                session_id,
-                bridge::BridgeOp::Read,
-                &path,
-                line,
-                Some(bridge_limit),
-                None,
-            )
-            .await?;
-            let mut snippet =
-                prepare_read_snippet(&response, start_line, requested_limit, MAX_READ_BYTES);
-
-            if let Some(hint) =
-                build_file_read_hint(&snippet, start_line, requested_limit, MAX_READ_BYTES)
-            {
-                if !snippet.text.is_empty() {
-                    snippet.text.push_str("\n\n");
-                }
-                snippet.text.push_str(&hint);
+        if let Some(hint) =
+            build_file_read_hint(&snippet, start_line, requested_limit, MAX_READ_BYTES)
+        {
+            if !snippet.text.is_empty() {
+                snippet.text.push_str("\n\n");
             }
-
-            let ReadSnippet {
-                text,
-                lines_returned,
-                end_line,
-                truncated_by_line_limit,
-                truncated_by_bytes,
-                additional_lines_available,
-                bytes_returned,
-            } = snippet;
-
-            let truncated =
-                truncated_by_line_limit || truncated_by_bytes || additional_lines_available;
-            let mut meta = json!({
-                "path": path,
-                "start_line": start_line,
-                "end_line": end_line,
-                "lines_returned": lines_returned,
-                "line_limit": requested_limit,
-                "bytes_returned": bytes_returned,
-                "truncated": truncated,
-                "truncated_by_line_limit": truncated_by_line_limit,
-                "truncated_by_bytes": truncated_by_bytes,
-                "additional_lines_available": additional_lines_available,
-            });
-            if truncated && let Some(obj) = meta.as_object_mut() {
-                obj.insert("next_line".to_string(), json!(end_line.saturating_add(1)));
-            }
-            if truncated_by_bytes && let Some(obj) = meta.as_object_mut() {
-                obj.insert("max_bytes".to_string(), json!(MAX_READ_BYTES));
-            }
-
-            Ok(json!({
-                "content": [{
-                    "type": "text",
-                    "text": text,
-                    "_meta": {
-                        "codex_fs_read": meta
-                    }
-                }]
-            }))
+            snippet.text.push_str(&hint);
         }
-        "write_text_file" => {
-            let WriteTextFileArgs { path, content } = serde_json::from_value(params.clone())?;
-            let mut final_content = content;
-            let mut staged_applied = false;
-            if let Some(entry) = staged_edits
-                .get(&path)
-                .filter(|entry| final_content.is_empty() || final_content == entry.content)
-            {
-                final_content = entry.content.clone();
-                staged_applied = true;
-            }
 
-            let _ = perform_bridge_request(
-                bridge_addr,
-                session_id,
-                bridge::BridgeOp::Write,
-                &path,
-                None,
-                None,
-                Some(final_content.clone()),
-            )
-            .await?;
+        let ReadSnippet {
+            text,
+            lines_returned,
+            end_line,
+            truncated_by_line_limit,
+            truncated_by_bytes,
+            additional_lines_available,
+            bytes_returned,
+        } = snippet;
 
-            staged_edits.stage(path.clone(), final_content);
+        let truncated = truncated_by_line_limit || truncated_by_bytes || additional_lines_available;
+        let mut meta = json!({
+            "path": path,
+            "start_line": start_line,
+            "end_line": end_line,
+            "lines_returned": lines_returned,
+            "line_limit": requested_limit,
+            "bytes_returned": bytes_returned,
+            "truncated": truncated,
+            "truncated_by_line_limit": truncated_by_line_limit,
+            "truncated_by_bytes": truncated_by_bytes,
+            "additional_lines_available": additional_lines_available,
+        });
 
-            let response_text = if staged_applied {
-                "write completed (applied staged edits)"
-            } else {
-                "write completed"
-            };
-
-            Ok(json!({
-                "content": [{
-                    "type": "text",
-                    "text": response_text
-                }]
-            }))
+        if truncated && let Some(obj) = meta.as_object_mut() {
+            obj.insert("next_line".to_string(), json!(end_line.saturating_add(1)));
         }
-        "edit_text_file" => {
-            let args: EditTextFileArgs = serde_json::from_value(params.clone())?;
-            let instructions = vec![EditInstruction {
-                old_text: args.old_string,
-                new_text: args.new_string,
-                replace_all: false,
-            }];
-            stage_edits(
-                bridge_addr,
-                session_id,
-                &args.path,
-                instructions,
-                staged_edits,
-            )
+
+        if truncated_by_bytes && let Some(obj) = meta.as_object_mut() {
+            obj.insert("max_bytes".to_string(), json!(MAX_READ_BYTES));
+        }
+
+        let mut meta_obj = Meta::new();
+        meta_obj.insert("codex_fs_read".to_string(), meta);
+        let content = RawContent::Text(RawTextContent {
+            text,
+            meta: Some(meta_obj),
+        })
+        .no_annotation();
+        Ok(CallToolResult::success(vec![content]))
+    }
+
+    /// Write workspace files via ACP bridge.
+    #[tool(description = "Write workspace files via ACP bridge.")]
+    async fn write_text_file(
+        &self,
+        Parameters(WriteTextFileArgs { path, content }): Parameters<WriteTextFileArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut final_content = content;
+        let mut staged_applied = false;
+        if let Some(entry) = self
+            .staged_edits
+            .get(&path)
             .await
+            .filter(|entry| final_content.is_empty() || final_content == entry.content)
+        {
+            final_content = entry.content.clone();
+            staged_applied = true;
         }
-        "multi_edit_text_file" => {
-            let args: MultiEditTextFileArgs = serde_json::from_value(params)?;
-            if args.edits.is_empty() {
-                return Err(anyhow!("edits array must not be empty"));
-            }
-            let instructions = args
-                .edits
-                .into_iter()
-                .map(|edit| EditInstruction {
-                    old_text: edit.old_string,
-                    new_text: edit.new_string,
-                    replace_all: edit.replace_all,
-                })
-                .collect::<Vec<_>>();
-            stage_edits(
-                bridge_addr,
-                session_id,
-                &args.path,
-                instructions,
-                staged_edits,
+
+        perform_bridge_request(
+            &self.bridge_addr,
+            &self.session_id,
+            bridge::BridgeOp::Write,
+            &path,
+            None,
+            None,
+            Some(final_content.clone()),
+        )
+        .await
+        .map_err(|e| {
+            McpError::internal_error(
+                "bridge write failed",
+                Some(json!({"reason": e.to_string()})),
             )
-            .await
+        })?;
+
+        self.staged_edits.stage(path.clone(), final_content).await;
+
+        let response_text = if staged_applied {
+            "write completed (applied staged edits)"
+        } else {
+            "write completed"
+        };
+        Ok(CallToolResult::success(vec![Content::text(response_text)]))
+    }
+
+    /// Apply a focused replacement in a file and persist the result.
+    #[tool(description = "Apply a focused replacement in a file and persist the result.")]
+    async fn edit_text_file(
+        &self,
+        Parameters(EditTextFileArgs {
+            path,
+            old_string,
+            new_string,
+        }): Parameters<EditTextFileArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let instructions = vec![EditInstruction {
+            old_text: old_string,
+            new_text: new_string,
+            replace_all: false,
+        }];
+        stage_edits(
+            &self.bridge_addr,
+            &self.session_id,
+            &path,
+            instructions,
+            &self.staged_edits,
+        )
+        .await
+    }
+
+    /// Apply multiple sequential replacements in a file and persist the result.
+    #[tool(
+        description = "Apply multiple sequential replacements in a file and persist the result."
+    )]
+    async fn multi_edit_text_file(
+        &self,
+        Parameters(MultiEditTextFileArgs { path, edits }): Parameters<MultiEditTextFileArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if edits.is_empty() {
+            return Err(McpError::invalid_params(
+                "edits array must not be empty",
+                None,
+            ));
         }
-        other => Err(anyhow!("unknown tool {other}")),
+        let instructions = edits
+            .into_iter()
+            .map(|edit| EditInstruction {
+                old_text: edit.old_string,
+                new_text: edit.new_string,
+                replace_all: edit.replace_all,
+            })
+            .collect::<Vec<_>>();
+
+        stage_edits(
+            &self.bridge_addr,
+            &self.session_id,
+            &path,
+            instructions,
+            &self.staged_edits,
+        )
+        .await
     }
 }
 
-#[derive(Deserialize)]
+#[tool_handler]
+impl ServerHandler for FsTools {
+    fn get_info(&self) -> ServerInfo {
+        let caps = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_tool_list_changed()
+            .build();
+        ServerInfo {
+            protocol_version: ProtocolVersion::default(),
+            capabilities: caps,
+            server_info: Implementation {
+                name: "codex-acp-fs".to_string(),
+                title: Some("Codex ACP Filesystem".to_string()),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                icons: None,
+                website_url: None,
+            },
+            instructions: None,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Clone)]
+struct EditEntry {
+    old_string: String,
+    new_string: String,
+    #[serde(default)]
+    replace_all: bool,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct ReadTextFileArgs {
     path: String,
     #[serde(default)]
@@ -353,31 +331,23 @@ struct ReadTextFileArgs {
     limit: Option<u32>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct WriteTextFileArgs {
     path: String,
     content: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct EditTextFileArgs {
     path: String,
     old_string: String,
     new_string: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct MultiEditTextFileArgs {
     path: String,
     edits: Vec<EditEntry>,
-}
-
-#[derive(Deserialize)]
-struct EditEntry {
-    old_string: String,
-    new_string: String,
-    #[serde(default)]
-    replace_all: bool,
 }
 
 struct EditInstruction {
@@ -391,9 +361,9 @@ async fn stage_edits(
     session_id: &str,
     path: &str,
     instructions: Vec<EditInstruction>,
-    staged_edits: &mut StagedEdits,
-) -> Result<serde_json::Value> {
-    let base_content = if let Some(entry) = staged_edits.get(path) {
+    staged_edits: &StagedEdits,
+) -> Result<CallToolResult, McpError> {
+    let base_content = if let Some(entry) = staged_edits.get(path).await {
         entry.content.clone()
     } else {
         match perform_bridge_request(
@@ -413,21 +383,22 @@ async fn stage_edits(
                 if is_missing_file_error(&message) {
                     String::new()
                 } else {
-                    return Err(err.context("failed to read current file content"));
+                    return Err(McpError::internal_error(
+                        "failed to read current file content",
+                        Some(json!({"reason": err.to_string()})),
+                    ));
                 }
             }
         }
     };
 
-    let new_content = apply_edits(&base_content, &instructions)?;
+    let new_content = apply_edits(&base_content, &instructions)
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
     if new_content == base_content {
-        return Ok(json!({
-            "content": [{
-                "type": "text",
-                "text": format!("No changes detected for {path}.")
-            }]
-        }));
+        return Ok(CallToolResult::success(vec![Content::text(format!(
+            "No changes detected for {path}."
+        ))]));
     }
 
     let diff_text = format_diff_for_path(path, &base_content, &new_content);
@@ -443,9 +414,15 @@ async fn stage_edits(
         None,
         Some(write_content.clone()),
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        McpError::internal_error(
+            "bridge write failed",
+            Some(json!({"reason": e.to_string()})),
+        )
+    })?;
 
-    staged_edits.stage(path.to_string(), write_content);
+    staged_edits.stage(path.to_string(), write_content).await;
     info!(file = %path, bytes = staged_bytes, "Staged edits committed");
 
     let (new_ranges, old_ranges) = parse_diff_line_ranges(&diff_text);
@@ -455,21 +432,17 @@ async fn stage_edits(
         "old_ranges": line_ranges_to_json(&old_ranges),
     });
 
-    Ok(json!({
-        "content": [
-            {
-                "type": "text",
-                "text": diff_text,
-                "_meta": {
-                    "codex_fs_diff": diff_meta
-                }
-            },
-            {
-                "type": "text",
-                "text": format!("Write completed for {path}.")
-            }
-        ]
-    }))
+    let mut meta_obj = Meta::new();
+    meta_obj.insert("codex_fs_diff".to_string(), diff_meta);
+    let diff_content = RawContent::Text(RawTextContent {
+        text: diff_text,
+        meta: Some(meta_obj),
+    })
+    .no_annotation();
+    Ok(CallToolResult::success(vec![
+        diff_content,
+        Content::text(format!("Write completed for {path}.")),
+    ]))
 }
 
 fn apply_edits(base: &str, edits: &[EditInstruction]) -> Result<String> {
@@ -752,94 +725,4 @@ async fn perform_bridge_request(
             .unwrap_or("bridge error");
         Err(anyhow!(message.to_string()))
     }
-}
-
-async fn write_message(
-    writer: &mut BufWriter<tokio::io::Stdout>,
-    value: serde_json::Value,
-) -> Result<()> {
-    let payload = serde_json::to_string(&value)?;
-    writer.write_all(payload.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-    Ok(())
-}
-
-fn read_tool_definition() -> serde_json::Value {
-    json!({
-        "name": "read_text_file",
-        "description": "Read workspace files via ACP bridge (paged to ~1000 lines/50KB; use line/limit to continue).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "Path to read." },
-                "line": { "type": "integer", "minimum": 1, "description": "Optional start line (1-indexed)." },
-                "limit": { "type": "integer", "minimum": 1, "description": "Optional number of lines to read." }
-            },
-            "required": ["path"],
-            "additionalProperties": false
-        }
-    })
-}
-
-fn write_tool_definition() -> serde_json::Value {
-    json!({
-        "name": "write_text_file",
-        "description": "Write workspace files via ACP bridge.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "Path to write." },
-                "content": { "type": "string", "description": "Full file contents." }
-            },
-            "required": ["path", "content"],
-            "additionalProperties": false
-        }
-    })
-}
-
-fn edit_tool_definition() -> serde_json::Value {
-    json!({
-        "name": "edit_text_file",
-        "description": "Apply a focused replacement in a file and persist the result.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "Path to modify." },
-                "old_string": { "type": "string", "description": "Existing text to replace (must match exactly)." },
-                "new_string": { "type": "string", "description": "Replacement text." }
-            },
-            "required": ["path", "old_string", "new_string"],
-            "additionalProperties": false
-        }
-    })
-}
-
-fn multi_edit_tool_definition() -> serde_json::Value {
-    json!({
-        "name": "multi_edit_text_file",
-        "description": "Apply multiple sequential replacements in a file and persist the result.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "Path to modify." },
-                "edits": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "old_string": { "type": "string", "description": "The text to replace." },
-                            "new_string": { "type": "string", "description": "Replacement text." },
-                            "replace_all": { "type": "boolean", "description": "Replace every occurrence (default false)." }
-                        },
-                        "required": ["old_string", "new_string"],
-                        "additionalProperties": false
-                    },
-                    "minItems": 1
-                }
-            },
-            "required": ["path", "edits"],
-            "additionalProperties": false
-        }
-    })
 }

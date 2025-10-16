@@ -18,7 +18,6 @@ codex-common = { git = "https://github.com/openai/codex", branch = "main", featu
 codex-core = { git = "https://github.com/openai/codex", branch = "main" }
 codex-protocol = { git = "https://github.com/openai/codex", branch = "main" }
 codex-app-server-protocol = { git = "https://github.com/openai/codex", branch = "main" }
-mcp-types = { git = "https://github.com/openai/codex", branch = "main" }
 tokio = { version = "1.47.1", features = [
     "macros",
     "rt",
@@ -34,3 +33,5 @@ diffy = { version = "0.4.2" }
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+rmcp = { version = "0.8", features = ["transport-io", "server", "macros", "schemars"] }
+schemars = { version = "1", features = ["derive"] }

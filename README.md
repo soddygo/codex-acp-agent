@@ -14,7 +14,7 @@ An Agent Client Protocol (ACP)–compatible agent that bridges the OpenAI Codex 
 - Slash commands with ACP AvailableCommands updates (advertised to clients on session start).
 - Status output tailored for IDEs (workspace, account, model, token usage).
 - Supports ACP session modes: `read-only`, `auto` (default), and `full-access`.
-- Automatically launches an internal MCP filesystem server (`acp_fs`) so Codex reads/writes files through ACP tooling instead of shell commands.
+- Automatically launches an internal MCP filesystem server (`acp_fs`) built with `rmcp`, so Codex reads/writes files through ACP tooling instead of shell commands.
 
 ## Requirements
 
@@ -82,14 +82,16 @@ make smoke
 }
 ```
 
-The agent automatically boots an MCP filesystem bridge. No extra configuration (or AGENTS.md edits) are required—Codex will discover the `acp_fs` server on every session.
+The agent automatically boots an MCP filesystem bridge (implemented with `rmcp`). No extra configuration (or AGENTS.md edits) are required—Codex will discover the `acp_fs` server on every session.
 
 ## Filesystem tooling
 
-When a session starts, `codex-acp` spins up an in-process TCP bridge and registers an MCP server named `acp_fs`. Codex then calls two structured tools:
+When a session starts, `codex-acp` spins up an in-process TCP bridge and registers an MCP server named `acp_fs` using `rmcp`. Codex then calls structured tools:
 
 - `read_text_file` — reads workspace files via ACP `client.read_text_file`, falling back to local disk if the client lacks FS support.
 - `write_text_file` — writes workspace files via ACP `client.write_text_file`, with a local fallback.
+- `edit_text_file` — apply a focused replace in a file and persist.
+- `multi_edit_text_file` — apply multiple sequential replacements and persist.
 
 `codex-acp` also injects a default instruction reminding the model to use these tools rather than shelling out with `cat`/`tee`. If your client exposes filesystem capabilities, file access stays within ACP.
 
