@@ -20,6 +20,7 @@ use codex_core::{
 };
 use codex_protocol::{
     ConversationId,
+    parse_command::ParsedCommand,
     plan_tool::{StepStatus, UpdatePlanArgs},
 };
 use serde_json::json;
@@ -151,6 +152,8 @@ impl CodexAgent {
                 command: exe_path.to_string_lossy().into_owned(),
                 args: vec!["--acp-fs-mcp".to_string()],
                 env: Some(env),
+                env_vars: vec![],
+                cwd: None,
             },
             enabled: true,
             startup_timeout_sec: Some(Duration::from_secs(5)),
@@ -182,12 +185,18 @@ impl CodexAgent {
         tool_timeout: Option<Duration>,
     ) -> (String, McpServerConfig) {
         let bearer_token = Self::extract_bearer_token(&headers);
+        let http_headers = headers
+            .iter()
+            .map(|header| (header.name.clone(), header.value.clone()))
+            .collect::<HashMap<_, _>>();
         (
             name,
             McpServerConfig {
                 transport: McpServerTransportConfig::StreamableHttp {
                     url,
                     bearer_token_env_var: bearer_token,
+                    http_headers: Some(http_headers),
+                    env_http_headers: None,
                 },
                 enabled: true,
                 startup_timeout_sec: startup_timeout,
@@ -234,6 +243,8 @@ impl CodexAgent {
                             command: command.to_string_lossy().into_owned(),
                             args,
                             env,
+                            env_vars: vec![],
+                            cwd: None,
                         },
                         enabled: true,
                         startup_timeout_sec: startup_timeout,
@@ -533,6 +544,77 @@ impl CodexAgent {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| raw_path.to_string())
     }
+
+    fn format_command_call(cwd: &Path, parsed_cmd: &[ParsedCommand]) -> FormatCommandCall {
+        let mut titles = Vec::new();
+        let mut locations = Vec::new();
+        let mut terminal_output = false;
+        let mut kind = acp::ToolKind::Execute;
+
+        for cmd in parsed_cmd {
+            let mut cmd_path: Option<PathBuf> = None;
+            match cmd {
+                ParsedCommand::Read { cmd: _, name, path } => {
+                    titles.push(format!("Read {name}"));
+                    cmd_path = Some(path.clone());
+                    kind = acp::ToolKind::Read;
+                }
+                ParsedCommand::ListFiles { cmd: _, path } => {
+                    let dir = if let Some(path) = path.as_ref() {
+                        &cwd.join(path)
+                    } else {
+                        cwd
+                    };
+                    titles.push(format!("List {}", dir.display()));
+                    cmd_path = path.as_ref().map(PathBuf::from);
+                    kind = acp::ToolKind::Search;
+                }
+                ParsedCommand::Search { cmd, query, path } => {
+                    titles.push(match (query, path.as_ref()) {
+                        (Some(query), Some(path)) => format!("Search {query} in {path}"),
+                        (Some(query), None) => format!("Search {query}"),
+                        _ => format!("Search {}", cmd),
+                    });
+                    cmd_path = path.as_ref().map(PathBuf::from);
+                    kind = acp::ToolKind::Search;
+                }
+                ParsedCommand::Unknown { cmd } => {
+                    titles.push(format!("Run {cmd}"));
+                    terminal_output = true;
+                }
+            }
+
+            if let Some(path) = cmd_path {
+                locations.push(acp::ToolCallLocation {
+                    path: if path.is_relative() {
+                        cwd.join(&path)
+                    } else {
+                        path
+                    },
+                    line: None,
+                    meta: None,
+                });
+            }
+        }
+
+        FormatCommandCall {
+            title: titles.join(", "),
+            terminal_output,
+            locations,
+            kind,
+        }
+    }
+
+    fn support_terminal(&self) -> bool {
+        self.client_capabilities.borrow().terminal
+    }
+}
+
+struct FormatCommandCall {
+    title: String,
+    terminal_output: bool,
+    locations: Vec<acp::ToolCallLocation>,
+    kind: acp::ToolKind,
 }
 
 struct FsToolMetadata {
@@ -987,20 +1069,38 @@ impl Agent for CodexAgent {
                 }
                 // Exec command begin/end → ACP ToolCall/ToolCallUpdate
                 EventMsg::ExecCommandBegin(beg) => {
+                    let FormatCommandCall {
+                        title,
+                        locations,
+                        terminal_output,
+                        kind,
+                    } = Self::format_command_call(&beg.cwd, &beg.parsed_cmd);
+
+                    let (content, meta) = if self.support_terminal() && terminal_output {
+                        let content = vec![acp::ToolCallContent::Terminal {
+                            terminal_id: acp::TerminalId(beg.call_id.clone().into()),
+                        }];
+                        let meta = Some(serde_json::json!({
+                            "terminal_info": {
+                                "terminal_id": beg.call_id,
+                                "cwd": beg.cwd
+                            }
+                        }));
+                        (content, meta)
+                    } else {
+                        (vec![], None)
+                    };
+
                     let tool = acp::ToolCall {
                         id: acp::ToolCallId(beg.call_id.clone().into()),
-                        title: format!("Running {}", beg.command.join(" ")),
-                        kind: acp::ToolKind::Execute,
+                        title,
+                        kind,
                         status: acp::ToolCallStatus::InProgress,
-                        content: Vec::new(),
-                        locations: vec![acp::ToolCallLocation {
-                            path: beg.cwd.clone(),
-                            line: None,
-                            meta: None,
-                        }],
+                        content,
+                        locations,
                         raw_input: Some(json!({"command": beg.command, "cwd": beg.cwd})),
                         raw_output: None,
-                        meta: None,
+                        meta,
                     };
                     self.send_session_update(&args.session_id, acp::SessionUpdate::ToolCall(tool))
                         .await?;
@@ -1052,18 +1152,24 @@ impl Agent for CodexAgent {
                 }
                 EventMsg::ExecApprovalRequest(req) => {
                     // Build a ToolCallUpdate describing the pending exec
-                    let title = format!("`{}`", req.command.join(" "));
+                    let FormatCommandCall {
+                        title,
+                        locations,
+                        terminal_output: _,
+                        kind,
+                    } = Self::format_command_call(&req.cwd, &req.parsed_cmd);
+
                     let update = acp::ToolCallUpdate {
                         id: acp::ToolCallId(req.call_id.clone().into()),
                         fields: acp::ToolCallUpdateFields {
-                            kind: Some(acp::ToolKind::Execute),
+                            kind: Some(kind),
                             status: Some(acp::ToolCallStatus::Pending),
                             title: Some(title),
-                            locations: Some(vec![acp::ToolCallLocation {
-                                path: req.cwd.clone(),
-                                line: None,
-                                meta: None,
-                            }]),
+                            locations: if locations.is_empty() {
+                                None
+                            } else {
+                                Some(locations)
+                            },
                             ..Default::default()
                         },
                         meta: None,
