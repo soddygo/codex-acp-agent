@@ -6,6 +6,7 @@ use std::rc::Rc;
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
+use crate::fs::FsBridge;
 use agent_client_protocol::{self as acp, Agent, Error, McpServer, PlanEntry, V1};
 use codex_app_server_protocol::AuthMode;
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
@@ -14,7 +15,7 @@ use codex_core::{
     config::Config as CodexConfig,
     config_types::{McpServerConfig, McpServerTransportConfig},
     protocol::{
-        AskForApproval, ErrorEvent, EventMsg, InputItem, McpInvocation, Op, PatchApplyEndEvent,
+        AskForApproval, ErrorEvent, EventMsg, McpInvocation, Op, PatchApplyEndEvent,
         ReviewDecision, SandboxPolicy, SessionSource, StreamErrorEvent, TokenUsage,
     },
 };
@@ -22,6 +23,7 @@ use codex_protocol::{
     ConversationId,
     parse_command::ParsedCommand,
     plan_tool::{StepStatus, UpdatePlanArgs},
+    user_input::UserInput,
 };
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot, oneshot::Sender};
@@ -29,12 +31,9 @@ use tokio::task;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::fs::FsBridge;
-
 mod commands;
 
-pub static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> =
-    LazyLock::new(builtin_approval_presets);
+static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 
 // Placeholder for per-session state. Holds the Codex conversation
 // handle, its id (for status/reporting), and bookkeeping for streaming.
@@ -158,6 +157,8 @@ impl CodexAgent {
             enabled: true,
             startup_timeout_sec: Some(Duration::from_secs(5)),
             tool_timeout_sec: Some(Duration::from_secs(30)),
+            enabled_tools: None,
+            disabled_tools: None,
         })
     }
 
@@ -201,6 +202,8 @@ impl CodexAgent {
                 enabled: true,
                 startup_timeout_sec: startup_timeout,
                 tool_timeout_sec: tool_timeout,
+                enabled_tools: None,
+                disabled_tools: None,
             },
         )
     }
@@ -249,6 +252,8 @@ impl CodexAgent {
                         enabled: true,
                         startup_timeout_sec: startup_timeout,
                         tool_timeout_sec: tool_timeout,
+                        enabled_tools: None,
+                        disabled_tools: None,
                     },
                 ))
             }
@@ -891,17 +896,17 @@ impl Agent for CodexAgent {
         self.reset_reasoning_tracking(&args.session_id);
 
         // Build user input submission items from prompt content blocks.
-        let mut items: Vec<InputItem> = Vec::new();
+        let mut items: Vec<UserInput> = Vec::new();
         for block in &args.prompt {
             match block {
                 acp::ContentBlock::Text(t) => {
-                    items.push(InputItem::Text {
+                    items.push(UserInput::Text {
                         text: t.text.clone(),
                     });
                 }
                 acp::ContentBlock::Image(img) => {
                     let url = format!("data:{};base64,{}", img.mime_type, img.data);
-                    items.push(InputItem::Image { image_url: url });
+                    items.push(UserInput::Image { image_url: url });
                 }
                 acp::ContentBlock::Audio(_a) => {
                     // Not supported by Codex input yet; skip.
@@ -909,13 +914,13 @@ impl Agent for CodexAgent {
                 acp::ContentBlock::Resource(res) => {
                     if let acp::EmbeddedResourceResource::TextResourceContents(trc) = &res.resource
                     {
-                        items.push(InputItem::Text {
+                        items.push(UserInput::Text {
                             text: trc.text.clone(),
                         });
                     }
                 }
                 acp::ContentBlock::ResourceLink(link) => {
-                    items.push(InputItem::Text {
+                    items.push(UserInput::Text {
                         text: format!("Resource: {}", link.uri),
                     });
                 }

@@ -101,6 +101,9 @@ async fn main() -> Result<()> {
             }
         });
 
-        handle_io.await
+        match handle_io.await {
+            Ok(()) => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e)),
+        }
     }).await
 }

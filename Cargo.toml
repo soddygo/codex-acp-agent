@@ -9,7 +9,7 @@ readme = "README.md"
 rust-version = "1.90"
 
 [dependencies]
-agent-client-protocol = { version = "0.4.7" }
+agent-client-protocol = { version = "0.5.0" }
 anyhow = { version = "1.0.100" }
 async-trait = { version = "0.1" }
 codex-common = { git = "https://github.com/openai/codex", branch = "main", features = [
@@ -33,7 +33,7 @@ diffy = { version = "0.4.2" }
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
-rmcp = { version = "0.8", features = [
+rmcp = { version = "0.8.2", features = [
     "transport-io",
     "server",
     "macros",
