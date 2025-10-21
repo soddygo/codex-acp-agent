@@ -20,7 +20,6 @@ impl CodexAgent {
             "new" => self.handle_new_cmd(session_id).await,
             "status" => self.handle_status_cmd(session_id).await,
             "model" => self.handle_model_cmd(session_id, rest).await,
-            "quit" => self.handle_quit_cmd(session_id).await,
             _ => Ok(false),
         }
     }
@@ -111,18 +110,6 @@ impl CodexAgent {
             format!("🧠 Requested model change to: `{}`", trimmed).into(),
         )
         .await?;
-        Ok(true)
-    }
-
-    async fn handle_quit_cmd(&self, session_id: &acp::SessionId) -> Result<bool, Error> {
-        let conversation = self.get_conversation(session_id).await?;
-        let mut quit_msg = "👋 Codex agent is shutting down. Goodbye!".to_string();
-
-        if let Err(e) = conversation.submit(Op::Shutdown).await {
-            quit_msg = format!("Failed to submit shutdown: {}", e);
-        }
-
-        self.send_message_chunk(session_id, quit_msg.into()).await?;
         Ok(true)
     }
 
