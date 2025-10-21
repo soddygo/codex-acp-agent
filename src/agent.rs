@@ -162,22 +162,6 @@ impl CodexAgent {
         })
     }
 
-    fn extract_bearer_token(headers: &[acp::HttpHeader]) -> Option<String> {
-        headers.iter().find_map(|header| {
-            header
-                .name
-                .eq_ignore_ascii_case("Authorization")
-                .then(|| {
-                    header
-                        .value
-                        .trim()
-                        .strip_prefix("Bearer ")
-                        .map(|token| token.trim().to_owned())
-                })
-                .flatten()
-        })
-    }
-
     fn build_streamable_http_server(
         name: String,
         url: String,
@@ -185,7 +169,6 @@ impl CodexAgent {
         startup_timeout: Option<Duration>,
         tool_timeout: Option<Duration>,
     ) -> (String, McpServerConfig) {
-        let bearer_token = Self::extract_bearer_token(&headers);
         let http_headers = headers
             .iter()
             .map(|header| (header.name.clone(), header.value.clone()))
@@ -195,8 +178,8 @@ impl CodexAgent {
             McpServerConfig {
                 transport: McpServerTransportConfig::StreamableHttp {
                     url,
-                    bearer_token_env_var: bearer_token,
                     http_headers: Some(http_headers),
+                    bearer_token_env_var: None,
                     env_http_headers: None,
                 },
                 enabled: true,
