@@ -48,7 +48,7 @@ Example JSON-RPC (initialize → new session → /status):
 {"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"1","prompt":[{"type":"text","text":"/status"}]}}
 ```
 
-## Usage (ACP over stdio)
+## Usage
 
 Minimal smoke test from a shell piping JSON-RPC over stdio:
 
@@ -115,12 +115,9 @@ The agent preserves ordering and includes any optional explanation text. This al
   - Implemented today:
     - `/new` — Start a new chat during a conversation.
     - `/init` — Create an `AGENTS.md` with repository contributor guidance. Uses a bundled prompt (`src/agent/prompt_init_command.md`).
-    - `/model` — Show or set the current model (uses `Op::OverrideTurnContext`).
-    - `/approvals` — Set approval mode (`ready-only | auto | full-access`).
     - `/status` — Rich status (workspace, account, model, token usage).
     - `/compact` — Request Codex to compact/summarize the conversation to reduce context size.
     - `/review` — Ask Codex to review current changes, highlight issues, and suggest fixes.
-    - `/quit` — Exit Codex agent. Shows a goodbye message and requests backend shutdown if available.
 
 - Session modes
   - Advertises `read-only`, `auto` (current), and `full-access` on new session.

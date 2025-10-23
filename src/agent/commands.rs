@@ -1,11 +1,16 @@
+use super::client_ops;
 use super::*;
 use agent_client_protocol::{AvailableCommand, AvailableCommandInput};
 use codex_core::{
     NewConversation,
     protocol::{AskForApproval, Op, ReviewRequest, SandboxPolicy},
 };
-use std::sync::LazyLock;
-use tokio::sync::oneshot;
+use codex_protocol::user_input::UserInput;
+use std::{
+    path::{Path, PathBuf},
+    sync::LazyLock,
+};
+use uuid::Uuid;
 
 pub static AVAILABLE_COMMANDS: LazyLock<Vec<AvailableCommand>> = LazyLock::new(built_in_commands);
 
@@ -14,12 +19,10 @@ impl CodexAgent {
         &self,
         session_id: &acp::SessionId,
         name: &str,
-        rest: &str,
     ) -> Result<bool, Error> {
         match name {
             "new" => self.handle_new_cmd(session_id).await,
             "status" => self.handle_status_cmd(session_id).await,
-            "model" => self.handle_model_cmd(session_id, rest).await,
             _ => Ok(false),
         }
     }
@@ -60,8 +63,6 @@ impl CodexAgent {
                 current_sandbox: self.config.sandbox_policy.clone(),
                 current_mode,
                 token_usage: None,
-                reasoning_sections: Vec::new(),
-                current_reasoning_chunk: String::new(),
             },
         );
 
@@ -74,42 +75,6 @@ impl CodexAgent {
         let status_text = self.render_status(session_id).await;
         self.send_message_chunk(session_id, status_text.into())
             .await?;
-        Ok(true)
-    }
-
-    async fn handle_model_cmd(
-        &self,
-        session_id: &acp::SessionId,
-        rest: &str,
-    ) -> Result<bool, Error> {
-        let trimmed = rest.trim();
-        if trimmed.is_empty() {
-            let msg = format!(
-                "Current model: {}\nUsage: /model <model-slug>",
-                self.config.model,
-            );
-            self.send_message_chunk(session_id, msg.into()).await?;
-            return Ok(true);
-        }
-
-        let conversation = self.get_conversation(session_id).await?;
-        conversation
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                sandbox_policy: None,
-                model: Some(trimmed.to_string()),
-                effort: None,
-                summary: None,
-            })
-            .await
-            .map_err(Error::into_internal_error)?;
-
-        self.send_message_chunk(
-            session_id,
-            format!("🧠 Requested model change to: `{}`", trimmed).into(),
-        )
-        .await?;
         Ok(true)
     }
 
@@ -328,7 +293,7 @@ impl CodexAgent {
     }
 
     fn client_supports_fs_read(&self) -> bool {
-        self.client_capabilities.borrow().fs.read_text_file
+        client_ops::supports_fs_read(&self.client_capabilities.borrow())
     }
 
     async fn client_read_text_file(
@@ -338,22 +303,7 @@ impl CodexAgent {
         line: Option<u32>,
         limit: Option<u32>,
     ) -> Result<acp::ReadTextFileResponse, Error> {
-        let (tx, rx) = oneshot::channel();
-        let request = acp::ReadTextFileRequest {
-            session_id: session_id.clone(),
-            path,
-            line,
-            limit,
-            meta: None,
-        };
-        self.client_tx
-            .send(ClientOp::ReadTextFile(request, tx))
-            .map_err(|_| {
-                Error::internal_error().with_data("client read_text_file channel closed")
-            })?;
-        rx.await.map_err(|_| {
-            Error::internal_error().with_data("client read_text_file response dropped")
-        })?
+        client_ops::read_text_file(&self.client_tx, session_id, path, line, limit).await
     }
 
     fn title_case(&self, s: &str) -> String {

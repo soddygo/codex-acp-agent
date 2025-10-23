@@ -1,12 +1,16 @@
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use agent_client_protocol as acp;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
-use tokio::task;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
+    net::{TcpListener, TcpStream},
+    sync::oneshot,
+    task,
+};
 use tracing::{debug, error, warn};
 
 use crate::agent::ClientOp;

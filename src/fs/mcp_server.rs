@@ -1,5 +1,12 @@
-use super::bridge;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
+use super::bridge;
 use anyhow::{Context, Result, anyhow};
 use diffy::{PatchFormatter, create_patch};
 use rmcp::{
@@ -14,11 +21,6 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
