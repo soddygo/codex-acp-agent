@@ -16,95 +16,6 @@ An Agent Client Protocol (ACP)–compatible agent that bridges the OpenAI Codex 
 - Supports ACP session modes: `read-only`, `auto` (default), and `full-access`.
 - Automatically launches an internal MCP filesystem server (`acp_fs`) built with `rmcp`, so Codex reads/writes files through ACP tooling instead of shell commands.
 
-## Requirements
-
-- Rust (Rust 2024 edition; rustc 1.90+ as pinned in `rust-toolchain.toml`).
-- Network access for building Git dependencies (Codex workspace, ACP crate).
-
-## Build
-
-```bash
-make build
-```
-
-## Run
-
-The agent communicates over stdin/stdout using ACP JSON-RPC. Launch it and connect from an ACP client (e.g., an IDE integration or a CLI client implementing ACP):
-
-```bash
-# With tracing logs
-RUST_LOG=info cargo run --quiet
-```
-
-Because this agent speaks on stdio, it is intended to be spawned by your client. For manual testing, you can pipe ACP JSON-RPC messages to stdin and read replies from stdout.
-
-> Tip: use `make release` (or `cargo build --release`) when shipping the binary to an IDE like Zed. The release build lives at `target/release/codex-acp`.
-
-Example JSON-RPC (initialize → new session → /status):
-
-```
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"v1","clientName":"cli","capabilities":{}}}
-{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/absolute/path","mcpServers":[]}}
-{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"1","prompt":[{"type":"text","text":"/status"}]}}
-```
-
-## Usage
-
-Minimal smoke test from a shell piping JSON-RPC over stdio:
-
-```bash
-printf '%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"v1","clientName":"cli","capabilities":{}}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"'"$PWD"'","mcpServers":[]}}' \
-  '{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"1","prompt":[{"type":"text","text":"/status"}]}}' \
-| RUST_LOG=info cargo run --quiet
-```
-
-Or use the included script and Makefile target:
-
-```bash
-chmod +x scripts/stdio-smoke.sh
-make smoke
-```
-
-### Configuration in [Zed](https://zed.dev)
-
-> Add this configuration to zed settings.
-```json
-"agent_servers": {
-  "Codex": {
-    "command": "codex-acp",
-    "args": [],
-    "env": {
-      "RUST_LOG": "info"
-    }
-  }
-}
-```
-
-The agent automatically boots an MCP filesystem bridge (implemented with `rmcp`). No extra configuration (or AGENTS.md edits) are required—Codex will discover the `acp_fs` server on every session.
-
-## Filesystem tooling
-
-When a session starts, `codex-acp` spins up an in-process TCP bridge and registers an MCP server named `acp_fs` using `rmcp`. Codex then calls structured tools:
-
-- `read_text_file` — reads workspace files via ACP `client.read_text_file`, falling back to local disk if the client lacks FS support.
-- `write_text_file` — writes workspace files via ACP `client.write_text_file`, with a local fallback.
-- `edit_text_file` — apply a focused replace in a file and persist.
-- `multi_edit_text_file` — apply multiple sequential replacements and persist.
-
-`codex-acp` also injects a default instruction reminding the model to use these tools rather than shelling out with `cat`/`tee`. If your client exposes filesystem capabilities, file access stays within ACP.
-
-## Plan Updates
-
-When Codex emits plan updates (step lists with statuses), the agent translates them into ACP `SessionUpdate::Plan` events. Clients receive structured plan entries with status mapping:
-
-- Pending → `pending`
-- InProgress → `in_progress`
-- Completed → `completed`
-
-The agent preserves ordering and includes any optional explanation text. This allows IDEs to render a live task checklist during long-running operations.
-
 ## Features
 
 - ACP Agent implementation
@@ -122,6 +33,45 @@ The agent preserves ordering and includes any optional explanation text. This al
 - Session modes
   - Advertises `read-only`, `auto` (current), and `full-access` on new session.
   - Clients may switch modes via ACP `session/setMode`; the agent emits `CurrentModeUpdate`.
+
+## Build
+
+### Requirements
+
+- Rust (Rust 2024 edition; rustc 1.90+ as pinned in `rust-toolchain.toml`).
+- Network access for building Git dependencies (Codex workspace, ACP crate).
+
+```bash
+make build
+```
+
+> Tip: use `make release` (or `cargo build --release`) when shipping the binary to an IDE like Zed. The release build lives at `target/release/codex-acp`.
+
+### Configuration in [Zed](https://zed.dev)
+
+> Add this configuration to zed settings.
+```json
+"agent_servers": {
+  "Codex": {
+    "command": "/path/to/codex-acp",
+    "args": [],
+    "env": {
+      "RUST_LOG": "info"
+    }
+  }
+}
+```
+
+## Filesystem tooling
+
+When a session starts, `codex-acp` spins up an in-process TCP bridge and registers an MCP server named `acp_fs` using `rmcp`. Codex then calls structured tools:
+
+- `read_text_file` — reads workspace files via ACP `client.read_text_file`, falling back to local disk if the client lacks FS support.
+- `write_text_file` — writes workspace files via ACP `client.write_text_file`, with a local fallback.
+- `edit_text_file` — apply a focused replace in a file and persist.
+- `multi_edit_text_file` — apply multiple sequential replacements and persist.
+
+`codex-acp` also injects a default instruction reminding the model to use these tools rather than shelling out with `cat`/`tee`. If your client exposes filesystem capabilities, file access stays within ACP.
 
 ## Status Output (`/status`)
 
@@ -156,11 +106,44 @@ Notes
 - Some fields may be unknown depending on your auth mode and environment.
 - Token counts are aggregated from Codex `EventMsg::TokenCount` when available.
 
+## Logging
+
+`codex-acp` uses `tracing` + `tracing-subscriber` and can log to stderr and/or a file. Configure it via environment variables:
+
+Environment variables (highest precedence first):
+- `CODEX_LOG_FILE` — Path to append logs (non-rotating). Parent directories are created automatically. ANSI is disabled for file logs.
+- `CODEX_LOG_DIR` — Directory for daily-rotated logs (file name: `acp.log`). Directory is created automatically. ANSI is disabled for file logs.
+- `CODEX_LOG_STDERR` — Set to `0`, `false`, `off`, or `no` to disable stderr logging. Enabled by default.
+- `RUST_LOG` — Standard filtering directives (defaults to `info` if unset/invalid). Examples: `info`, `debug`, `codex_acp=trace,rmcp=info`.
+
+Behavior:
+- If `CODEX_LOG_FILE` is set, logs go to stderr (unless disabled) and the specified file.
+- Else if `CODEX_LOG_DIR` is set, logs go to stderr (unless disabled) and a daily-rotated file in that directory.
+- Else logs go to stderr only (unless disabled).
+
+Examples:
+```bash
+# Console only
+RUST_LOG=info cargo run --quiet
+
+# Console + append to file (non-rotating)
+RUST_LOG=debug CODEX_LOG_FILE=./logs/codex-acp.log cargo run --quiet
+
+# Console + daily rotation under logs directory
+RUST_LOG=info CODEX_LOG_DIR=./logs cargo run --quiet
+
+# File only (disable stderr)
+CODEX_LOG_STDERR=0 CODEX_LOG_FILE=./logs/codex-acp.log cargo run --quiet
+
+# MCP filesystem server also honors logging env:
+RUST_LOG=debug CODEX_LOG_DIR=./logs cargo run --quiet -- --acp-fs-mcp
+```
+
 ## Development
 
 - Branching: prefer topic branches; small, focused commits.
 - Lint/test locally using `cargo check`, `cargo fmt`, `cargo clippy`, and `cargo test`.
-- Logging uses `tracing` + `tracing-subscriber`; use `RUST_LOG=info` during development.
+- Logging: see the Logging section above for configuration. Typical dev setup: `RUST_LOG=info`.
 
 ## Related Projects
 

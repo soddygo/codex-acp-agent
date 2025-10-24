@@ -1,33 +1,29 @@
-use codex_acp::agent;
-use codex_acp::{CodexAgent, FsBridge, SessionModeLookup};
+use codex_acp::{CodexAgent, FsBridge, SessionModeLookup, agent};
 
 use agent_client_protocol::{AgentSideConnection, Client, Error};
 use anyhow::Result;
+use codex_core::config::{Config, ConfigOverrides};
 use std::env;
-use tokio::{io, sync::mpsc, task};
+use tokio::{
+    io,
+    sync::mpsc,
+    task::{self, LocalSet},
+};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 use tracing::error;
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
-
-use codex_core::config::{Config, ConfigOverrides};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    let _logging = codex_acp::init_from_env()?;
+
     if env::args().nth(1).as_deref() == Some("--acp-fs-mcp") {
         return codex_acp::fs::run_mcp_server().await;
     }
 
-    // Initialize tracing with env filter (RUST_LOG compatible).
-    let filter = EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("info"))?;
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(filter)
-        .init();
-
     let outgoing = io::stdout().compat_write();
     let incoming = io::stdin().compat();
 
-    let local_set = task::LocalSet::new();
+    let local_set = LocalSet::new();
     local_set.run_until(async move {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (client_tx, mut client_rx) = mpsc::unbounded_channel();

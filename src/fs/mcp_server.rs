@@ -51,6 +51,7 @@ struct ReadSnippet {
 }
 
 pub async fn run() -> Result<()> {
+    let _logging = crate::logging::init_from_env()?;
     // Capture required env to talk to our local bridge and session.
     let bridge_addr = std::env::var("ACP_FS_BRIDGE_ADDR")
         .context("ACP_FS_BRIDGE_ADDR environment variable is required")?;
