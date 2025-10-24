@@ -23,8 +23,7 @@ An Agent Client Protocol (ACP)–compatible agent that bridges the OpenAI Codex 
   - Streams Codex events (assistant text and deltas, reasoning deltas, token counts) as `session/update` notifications.
 
 - Slash commands (advertised via `AvailableCommandsUpdate`)
-  - Implemented today:
-    - `/new` — Start a new chat during a conversation.
+  - Implemented:
     - `/init` — Create an `AGENTS.md` with repository contributor guidance. Uses a bundled prompt (`src/agent/prompt_init_command.md`).
     - `/status` — Rich status (workspace, account, model, token usage).
     - `/compact` — Request Codex to compact/summarize the conversation to reduce context size.
@@ -73,6 +72,8 @@ When a session starts, `codex-acp` spins up an in-process TCP bridge and registe
 
 `codex-acp` also injects a default instruction reminding the model to use these tools rather than shelling out with `cat`/`tee`. If your client exposes filesystem capabilities, file access stays within ACP.
 
+Note: The acp_fs tools are dynamically enabled or disabled based on the client's filesystem capabilities. If the client does not support reading files, `read_text_file` is hidden. If the client does not support writing files, `write_text_file`, `edit_text_file`, and `multi_edit_text_file` are hidden.
+
 ## Status Output (`/status`)
 
 The `/status` command prints a human-friendly summary, e.g.:
@@ -82,7 +83,6 @@ The `/status` command prints a human-friendly summary, e.g.:
   • Path: ~/path/to/workspace
   • Approval Mode: on-request
   • Sandbox: workspace-write
-  • AGENTS files: (none)
 
 👤 Account
   • Signed in with ChatGPT (or API key / Not signed in)

@@ -1,97 +1,18 @@
-use super::client_ops;
-use super::*;
-use agent_client_protocol::{AvailableCommand, AvailableCommandInput};
-use codex_core::{
-    NewConversation,
-    protocol::{AskForApproval, Op, ReviewRequest, SandboxPolicy},
-};
+use std::{path::Path, sync::LazyLock};
+
+use crate::CodexAgent;
+use agent_client_protocol::{AvailableCommand, SessionId};
+use codex_core::protocol::{AskForApproval, Op, ReviewRequest, SandboxPolicy};
 use codex_protocol::user_input::UserInput;
-use std::{
-    path::{Path, PathBuf},
-    sync::LazyLock,
-};
-use uuid::Uuid;
 
 pub static AVAILABLE_COMMANDS: LazyLock<Vec<AvailableCommand>> = LazyLock::new(built_in_commands);
 
 impl CodexAgent {
-    pub async fn handle_slash_command(
-        &self,
-        session_id: &acp::SessionId,
-        name: &str,
-    ) -> Result<bool, Error> {
-        match name {
-            "new" => self.handle_new_cmd(session_id).await,
-            "status" => self.handle_status_cmd(session_id).await,
-            _ => Ok(false),
-        }
-    }
-
-    async fn handle_new_cmd(&self, session_id: &acp::SessionId) -> Result<bool, Error> {
-        let (conversation_id, conversation) = match self
-            .conversation_manager
-            .new_conversation(self.config.clone())
-            .await
-        {
-            Ok(NewConversation {
-                conversation_id,
-                conversation,
-                ..
-            }) => (conversation_id, conversation),
-            Err(e) => {
-                self.send_message_chunk(
-                    session_id,
-                    format!("Failed to start new conversation: {}", e).into(),
-                )
-                .await?;
-                return Ok(true);
-            }
-        };
-
-        let current_mode = Self::modes(&self.config)
-            .as_ref()
-            .map(|m| m.current_mode_id.clone())
-            .unwrap_or(acp::SessionModeId("auto".into()));
-
-        let fs_session_id = Uuid::new_v4().to_string();
-        self.sessions.borrow_mut().insert(
-            conversation_id.to_string(),
-            SessionState {
-                fs_session_id,
-                conversation: Some(conversation.clone()),
-                current_approval: self.config.approval_policy,
-                current_sandbox: self.config.sandbox_policy.clone(),
-                current_mode,
-                token_usage: None,
-            },
-        );
-
-        self.send_message_chunk(session_id, "✨ Started a new conversation".into())
-            .await?;
-        Ok(true)
-    }
-
-    async fn handle_status_cmd(&self, session_id: &acp::SessionId) -> Result<bool, Error> {
-        let status_text = self.render_status(session_id).await;
-        self.send_message_chunk(session_id, status_text.into())
-            .await?;
-        Ok(true)
-    }
-
-    pub async fn handle_background_task_command(
-        &self,
-        session_id: &acp::SessionId,
-        name: &str,
-    ) -> Option<Op> {
-        if !matches!(name, "init" | "review" | "compact") {
-            return None;
-        }
-
+    pub async fn handle_slash_command(&self, session_id: &SessionId, name: &str) -> Option<Op> {
         let mut msg = String::default();
-        // Commands forwarded to Codex as protocol Ops
         let op = match name {
             "init" => {
-                let prompt = include_str!("./prompt_init_command.md");
+                let prompt = include_str!("prompt_init_command.md");
 
                 msg = "📝 Creating AGENTS.md file with initial instructions...\n\n".into();
                 Some(Op::UserInput {
@@ -99,6 +20,14 @@ impl CodexAgent {
                         text: prompt.into(),
                     }],
                 })
+            }
+            "status" => {
+                let status_text = self.render_status(session_id).await;
+                drop(
+                    self.send_message_chunk(session_id, status_text.into())
+                        .await,
+                );
+                None
             }
             "compact" => {
                 self.with_session_state_mut(session_id, |state| {
@@ -125,7 +54,7 @@ impl CodexAgent {
         op
     }
 
-    async fn render_status(&self, session_id: &acp::SessionId) -> String {
+    async fn render_status(&self, session_id: &SessionId) -> String {
         let sid_str = session_id.0.as_ref();
         // Session snapshot
         let (approval_mode, sandbox_mode, token_usage) = {
@@ -146,16 +75,6 @@ impl CodexAgent {
 
         // Workspace
         let cwd = self.shorten_home(&self.config.cwd);
-        let agents_files = self.find_agents_files(Some(session_id)).await;
-        let agents_line = if agents_files.is_empty() {
-            "(none)".to_string()
-        } else {
-            agents_files
-                .iter()
-                .map(|f| self.shorten_home(&self.config.cwd.join(f)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
 
         // Account
         let (auth_mode, email, plan): (String, String, String) =
@@ -211,7 +130,6 @@ impl CodexAgent {
     Path:          {cwd}
     Approval Mode: {approval}
     Sandbox:       {sandbox}
-    AGENTS files:  {agents}
 
 👤 Account
 
@@ -236,7 +154,6 @@ impl CodexAgent {
             cwd = cwd,
             approval = approval_mode,
             sandbox = sandbox_mode,
-            agents = agents_line,
             auth_mode = auth_mode,
             email = email,
             plan = plan,
@@ -262,50 +179,6 @@ impl CodexAgent {
         s
     }
 
-    async fn find_agents_files(&self, session_id: Option<&acp::SessionId>) -> Vec<String> {
-        let mut names = Vec::new();
-        let candidates = ["AGENTS.md", "Agents.md", "agents.md"];
-
-        for candidate in candidates.iter() {
-            let path = self.config.cwd.join(candidate);
-            let mut found = false;
-
-            if let Some(session_id) = session_id
-                && self.client_supports_fs_read()
-                && self
-                    .client_read_text_file(session_id, path.clone(), Some(1), Some(1))
-                    .await
-                    .is_ok()
-            {
-                found = true;
-            }
-
-            if !found && path.exists() {
-                found = true;
-            }
-
-            if found {
-                names.push((*candidate).to_string());
-            }
-        }
-
-        names
-    }
-
-    fn client_supports_fs_read(&self) -> bool {
-        client_ops::supports_fs_read(&self.client_capabilities.borrow())
-    }
-
-    async fn client_read_text_file(
-        &self,
-        session_id: &acp::SessionId,
-        path: PathBuf,
-        line: Option<u32>,
-        limit: Option<u32>,
-    ) -> Result<acp::ReadTextFileResponse, Error> {
-        client_ops::read_text_file(&self.client_tx, session_id, path, line, limit).await
-    }
-
     fn title_case(&self, s: &str) -> String {
         if s.is_empty() {
             return s.to_string();
@@ -319,12 +192,6 @@ impl CodexAgent {
 
 fn built_in_commands() -> Vec<AvailableCommand> {
     vec![
-        AvailableCommand {
-            name: "new".into(),
-            description: "start a new chat during a conversation".into(),
-            input: None,
-            meta: None,
-        },
         AvailableCommand {
             name: "init".into(),
             description: "create an AGENTS.md file with instructions for Codex".into(),
@@ -344,30 +211,8 @@ fn built_in_commands() -> Vec<AvailableCommand> {
             meta: None,
         },
         AvailableCommand {
-            name: "model".into(),
-            description: "choose what model and reasoning effort to use".into(),
-            input: Some(AvailableCommandInput::Unstructured {
-                hint: "Model slug, e.g., gpt-codex".into(),
-            }),
-            meta: None,
-        },
-        AvailableCommand {
-            name: "approvals".into(),
-            description: "choose what Codex can do without approval".into(),
-            input: Some(AvailableCommandInput::Unstructured {
-                hint: "read-only|auto|full-access".into(),
-            }),
-            meta: None,
-        },
-        AvailableCommand {
             name: "status".into(),
             description: "show current session configuration and token usage".into(),
-            input: None,
-            meta: None,
-        },
-        AvailableCommand {
-            name: "quit".into(),
-            description: "exit Codex".into(),
             input: None,
             meta: None,
         },

@@ -32,7 +32,6 @@ use tokio::{
 use tracing::{info, warn};
 use uuid::Uuid;
 
-mod client_ops;
 mod commands;
 mod events;
 mod modes;
@@ -110,7 +109,19 @@ impl CodexAgent {
             startup_timeout_sec: Some(Duration::from_secs(5)),
             tool_timeout_sec: Some(Duration::from_secs(30)),
             enabled_tools: None,
-            disabled_tools: None,
+            disabled_tools: {
+                let caps = self.client_capabilities.borrow();
+                let mut v: Vec<String> = Vec::new();
+                if !caps.fs.read_text_file {
+                    v.push("read_text_file".to_string());
+                }
+                if !caps.fs.write_text_file {
+                    v.push("write_text_file".to_string());
+                    v.push("edit_text_file".to_string());
+                    v.push("multi_edit_text_file".to_string());
+                }
+                if v.is_empty() { None } else { Some(v) }
+            },
         })
     }
 
@@ -201,7 +212,7 @@ impl CodexAgent {
         mcp_servers: Vec<McpServer>,
     ) -> Result<CodexConfig, Error> {
         let mut session_config = self.config.clone();
-        let fs_guidance = include_str!("../prompt_fs_guidance.md");
+        let fs_guidance = include_str!("prompt_fs_guidance.md");
 
         if let Some(mut base) = session_config.base_instructions.take() {
             if !base.contains("acp_fs") {
@@ -286,15 +297,13 @@ impl CodexAgent {
         update: acp::SessionUpdate,
     ) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
+        let notification = acp::SessionNotification {
+            session_id: session_id.clone(),
+            update,
+            meta: None,
+        };
         self.session_update_tx
-            .send((
-                acp::SessionNotification {
-                    session_id: session_id.clone(),
-                    update,
-                    meta: None,
-                },
-                tx,
-            ))
+            .send((notification, tx))
             .map_err(Error::into_internal_error)?;
         rx.await.map_err(Error::into_internal_error)
     }
@@ -304,11 +313,8 @@ impl CodexAgent {
         session_id: &acp::SessionId,
         content: acp::ContentBlock,
     ) -> Result<(), Error> {
-        self.send_session_update(
-            session_id,
-            acp::SessionUpdate::AgentMessageChunk { content },
-        )
-        .await
+        let chunk = acp::SessionUpdate::AgentMessageChunk { content };
+        self.send_session_update(session_id, chunk).await
     }
 
     pub async fn send_thought_chunk(
@@ -316,11 +322,8 @@ impl CodexAgent {
         session_id: &acp::SessionId,
         content: acp::ContentBlock,
     ) -> Result<(), Error> {
-        self.send_session_update(
-            session_id,
-            acp::SessionUpdate::AgentThoughtChunk { content },
-        )
-        .await
+        let chunk = acp::SessionUpdate::AgentThoughtChunk { content };
+        self.send_session_update(session_id, chunk).await
     }
 
     fn with_session_state_mut<R, F>(&self, session_id: &acp::SessionId, f: F) -> Option<R>
@@ -578,16 +581,17 @@ impl Agent for CodexAgent {
             if let Some(cmd) = line.strip_prefix('/') {
                 let mut parts = cmd.split_whitespace();
                 let name = parts.next().unwrap_or("").to_lowercase();
-                if self.handle_slash_command(&args.session_id, &name).await? {
-                    return Ok(acp::PromptResponse {
-                        stop_reason: acp::StopReason::EndTurn,
-                        meta: None,
-                    });
+                match self.handle_slash_command(&args.session_id, &name).await {
+                    Some(op) => {
+                        op_opt = Some(op);
+                    }
+                    None => {
+                        return Ok(acp::PromptResponse {
+                            stop_reason: acp::StopReason::EndTurn,
+                            meta: None,
+                        });
+                    }
                 }
-
-                op_opt = self
-                    .handle_background_task_command(&args.session_id, &name)
-                    .await;
             }
         }
 
