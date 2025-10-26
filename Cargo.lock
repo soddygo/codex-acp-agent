@@ -15,9 +15,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol"
-version = "0.5.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f655394a107cd601bd2e5375c2d909ea83adc65678a0e0e8d77613d3c848a7d"
+checksum = "525705e39c11cd73f7bc784e3681a9386aa30c8d0630808d3dc2237eb4f9cb1b"
 dependencies = [
  "agent-client-protocol-schema",
  "anyhow",
@@ -33,9 +33,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-schema"
-version = "0.4.11"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61be4454304d7df1a5b44c4ae55e707ffe72eac4dfb1ef8762510ce8d8f6d924"
+checksum = "ecf16c18fea41282d6bbadd1549a06be6836bddb1893f44a6235f340fa24e2af"
 dependencies = [
  "anyhow",
  "derive_more",
@@ -443,9 +443,9 @@ dependencies = [
 
 [[package]]
 name = "bstr"
-version = "1.12.0"
+version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "234113d19d0d7d613b40e86fb654acf958910802bcceab913a4f9e7cda03b1a4"
+checksum = "63044e1ae8e69f3b5a92c736ca6269b8d12fa7efe39bf34ddb06d102cf0e2cab"
 dependencies = [
  "memchr",
  "regex-automata",
@@ -481,9 +481,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.41"
+version = "1.2.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac9fe6cdbb24b6ade63616c0a0688e45bb56732262c158df3c0c4bea4ca47cb7"
+checksum = "739eb0f94557554b3ca9a86d2d37bebd49c5e6d0c1d2bda35ba5bdac830befc2"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -611,7 +611,7 @@ dependencies = [
 [[package]]
 name = "codex-app-server-protocol"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#ed77d2d977c1a6a2dac5174367963c2c71bdf35c"
+source = "git+https://github.com/openai/codex?branch=main#a55b0c4bcc42089d7b53a1aebd5b31709c536c55"
 dependencies = [
  "anyhow",
  "clap",
@@ -628,7 +628,7 @@ dependencies = [
 [[package]]
 name = "codex-apply-patch"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#ed77d2d977c1a6a2dac5174367963c2c71bdf35c"
+source = "git+https://github.com/openai/codex?branch=main#a55b0c4bcc42089d7b53a1aebd5b31709c536c55"
 dependencies = [
  "anyhow",
  "similar",
@@ -640,7 +640,7 @@ dependencies = [
 [[package]]
 name = "codex-async-utils"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#ed77d2d977c1a6a2dac5174367963c2c71bdf35c"
+source = "git+https://github.com/openai/codex?branch=main#a55b0c4bcc42089d7b53a1aebd5b31709c536c55"
 dependencies = [
  "async-trait",
  "tokio",
@@ -650,7 +650,7 @@ dependencies = [
 [[package]]
 name = "codex-common"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#ed77d2d977c1a6a2dac5174367963c2c71bdf35c"
+source = "git+https://github.com/openai/codex?branch=main#a55b0c4bcc42089d7b53a1aebd5b31709c536c55"
 dependencies = [
  "clap",
  "codex-app-server-protocol",
@@ -663,7 +663,7 @@ dependencies = [
 [[package]]
 name = "codex-core"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#ed77d2d977c1a6a2dac5174367963c2c71bdf35c"
+source = "git+https://github.com/openai/codex?branch=main#a55b0c4bcc42089d7b53a1aebd5b31709c536c55"
 dependencies = [
  "anyhow",
  "askama",
@@ -688,6 +688,7 @@ dependencies = [
  "env-flags",
  "eventsource-stream",
  "futures",
+ "http",
  "indexmap 2.12.0",
  "landlock",
  "libc",
@@ -723,7 +724,7 @@ dependencies = [
 [[package]]
 name = "codex-file-search"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#ed77d2d977c1a6a2dac5174367963c2c71bdf35c"
+source = "git+https://github.com/openai/codex?branch=main#a55b0c4bcc42089d7b53a1aebd5b31709c536c55"
 dependencies = [
  "anyhow",
  "clap",
@@ -737,7 +738,7 @@ dependencies = [
 [[package]]
 name = "codex-otel"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#ed77d2d977c1a6a2dac5174367963c2c71bdf35c"
+source = "git+https://github.com/openai/codex?branch=main#a55b0c4bcc42089d7b53a1aebd5b31709c536c55"
 dependencies = [
  "chrono",
  "codex-app-server-protocol",
@@ -759,7 +760,7 @@ dependencies = [
 [[package]]
 name = "codex-protocol"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#ed77d2d977c1a6a2dac5174367963c2c71bdf35c"
+source = "git+https://github.com/openai/codex?branch=main#a55b0c4bcc42089d7b53a1aebd5b31709c536c55"
 dependencies = [
  "base64",
  "icu_decimal",
@@ -781,7 +782,7 @@ dependencies = [
 [[package]]
 name = "codex-rmcp-client"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#ed77d2d977c1a6a2dac5174367963c2c71bdf35c"
+source = "git+https://github.com/openai/codex?branch=main#a55b0c4bcc42089d7b53a1aebd5b31709c536c55"
 dependencies = [
  "anyhow",
  "axum",
@@ -806,7 +807,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-pty"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#ed77d2d977c1a6a2dac5174367963c2c71bdf35c"
+source = "git+https://github.com/openai/codex?branch=main#a55b0c4bcc42089d7b53a1aebd5b31709c536c55"
 dependencies = [
  "anyhow",
  "portable-pty",
@@ -816,12 +817,12 @@ dependencies = [
 [[package]]
 name = "codex-utils-string"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#ed77d2d977c1a6a2dac5174367963c2c71bdf35c"
+source = "git+https://github.com/openai/codex?branch=main#a55b0c4bcc42089d7b53a1aebd5b31709c536c55"
 
 [[package]]
 name = "codex-utils-tokenizer"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#ed77d2d977c1a6a2dac5174367963c2c71bdf35c"
+source = "git+https://github.com/openai/codex?branch=main#a55b0c4bcc42089d7b53a1aebd5b31709c536c55"
 dependencies = [
  "anyhow",
  "thiserror 2.0.17",
@@ -998,9 +999,9 @@ dependencies = [
 
 [[package]]
 name = "deranged"
-version = "0.5.4"
+version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a41953f86f8a05768a6cda24def994fd2f424b04ec5c719cf89989779f199071"
+checksum = "ececcb659e7ba858fb4f10388c250a7252eb0a27373f1a72b8748afdd248e587"
 dependencies = [
  "powerfmt",
  "serde_core",
@@ -2101,7 +2102,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 [[package]]
 name = "mcp-types"
 version = "0.0.0"
-source = "git+https://github.com/openai/codex?branch=main#ed77d2d977c1a6a2dac5174367963c2c71bdf35c"
+source = "git+https://github.com/openai/codex?branch=main#a55b0c4bcc42089d7b53a1aebd5b31709c536c55"
 dependencies = [
  "schemars 0.8.22",
  "serde",

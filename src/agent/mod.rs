@@ -9,7 +9,7 @@ use std::{
 
 use crate::agent::session::SessionState;
 use crate::fs::FsBridge;
-use agent_client_protocol::{self as acp, Agent, Error, McpServer, V1};
+use agent_client_protocol::{self as acp, Agent, Error, Implementation, McpServer, V1};
 use codex_app_server_protocol::AuthMode;
 use codex_core::{
     AuthManager, CodexConversation, ConversationManager, NewConversation,
@@ -313,7 +313,10 @@ impl CodexAgent {
         session_id: &acp::SessionId,
         content: acp::ContentBlock,
     ) -> Result<(), Error> {
-        let chunk = acp::SessionUpdate::AgentMessageChunk { content };
+        let chunk = acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk {
+            content,
+            meta: None,
+        });
         self.send_session_update(session_id, chunk).await
     }
 
@@ -322,7 +325,10 @@ impl CodexAgent {
         session_id: &acp::SessionId,
         content: acp::ContentBlock,
     ) -> Result<(), Error> {
-        let chunk = acp::SessionUpdate::AgentThoughtChunk { content };
+        let chunk = acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk {
+            content,
+            meta: None,
+        });
         self.send_session_update(session_id, chunk).await
     }
 
@@ -400,6 +406,11 @@ impl Agent for CodexAgent {
             protocol_version: V1,
             agent_capabilities,
             auth_methods,
+            agent_info: Some(Implementation {
+                name: "codex-acp".into(),
+                title: Some("Codex ACP".into()),
+                version: env!("CARGO_PKG_VERSION").into(),
+            }),
             meta: None,
         })
     }
@@ -498,7 +509,12 @@ impl Agent for CodexAgent {
                 let _ = tx_updates.send((
                     acp::SessionNotification {
                         session_id: acp::SessionId(session_id.clone().into()),
-                        update: acp::SessionUpdate::AvailableCommandsUpdate { available_commands },
+                        update: acp::SessionUpdate::AvailableCommandsUpdate(
+                            acp::AvailableCommandsUpdate {
+                                available_commands,
+                                meta: None,
+                            },
+                        ),
                         meta: None,
                     },
                     tx,
