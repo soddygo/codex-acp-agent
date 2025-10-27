@@ -19,7 +19,8 @@ An Agent Client Protocol (ACP)–compatible agent that bridges the OpenAI Codex 
 ## Features
 
 - ACP Agent implementation
-  - Handles `initialize`, `authenticate` (API key), `session/new`, `session/prompt`, `session/cancel`.
+  - Handles `initialize`, `authenticate`, `session/new`, `session/prompt`, `session/cancel`.
+  - Authentication support for OpenAI (ChatGPT/API key) and custom model providers.
   - Streams Codex events (assistant text and deltas, reasoning deltas, token counts) as `session/update` notifications.
 
 - Slash commands (advertised via `AvailableCommandsUpdate`)
@@ -32,6 +33,12 @@ An Agent Client Protocol (ACP)–compatible agent that bridges the OpenAI Codex 
 - Session modes
   - Advertises `read-only`, `auto` (current), and `full-access` on new session.
   - Clients may switch modes via ACP `session/setMode`; the agent emits `CurrentModeUpdate`.
+
+- Custom model provider support
+  - Dynamic model listing and switching for custom (non-OpenAI) providers.
+  - Model format: `{provider_id}@{model_name}` (e.g., `anthropic@claude-3-opus`).
+  - Configure providers and models via Codex config profiles.
+  - Dedicated `custom_provider` authentication method for non-builtin providers.
 
 ## Build
 
@@ -105,6 +112,52 @@ The `/status` command prints a human-friendly summary, e.g.:
 Notes
 - Some fields may be unknown depending on your auth mode and environment.
 - Token counts are aggregated from Codex `EventMsg::TokenCount` when available.
+
+## Authentication
+
+`codex-acp` supports multiple authentication methods:
+
+### OpenAI (Builtin Provider)
+- **ChatGPT**: Sign in with your ChatGPT account via `codex login`
+- **API Key**: Use `OPENAI_API_KEY` from environment or `auth.json`
+
+### Custom Providers
+For custom model providers (e.g., Anthropic, custom LLMs):
+1. Configure the provider in your Codex config:
+   ```toml
+   model_provider_id = "anthropic"
+   model = "claude-3-opus"
+   
+   [model_providers.anthropic]
+   name = "Anthropic"
+   # ... provider-specific configuration
+   
+   [profiles.custom-fast]
+   model = "claude-3-haiku"
+   model_provider = "anthropic"
+   ```
+
+2. The agent will advertise a `custom_provider` authentication method during initialization.
+
+3. Authenticate with provider-specific credentials configured in your Codex setup.
+
+### Provider-Specific Features
+- **OpenAI**: Standard authentication, no model switching (uses config defaults)
+- **Custom Providers**: 
+  - Model listing via `available_models` in session responses
+  - Model switching via `session/setModel` with `{provider}@{model}` format
+  - Multiple model profiles for easy switching
+
+Example model switching (custom providers only):
+```json
+{
+  "method": "session/setModel",
+  "params": {
+    "session_id": "...",
+    "model_id": "anthropic@claude-3-haiku"
+  }
+}
+```
 
 ## Logging
 
