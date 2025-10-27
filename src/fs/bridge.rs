@@ -235,7 +235,7 @@ impl FsBridgeInner {
         limit: Option<u32>,
     ) -> Result<String, String> {
         match self
-            .read_via_client(session_id.clone(), path.to_path_buf(), line, limit)
+            .read_via_client(session_id.clone(), path.display().to_string(), line, limit)
             .await
         {
             Ok(content) => Ok(content),
@@ -249,20 +249,24 @@ impl FsBridgeInner {
     async fn read_via_client(
         &self,
         session_id: acp::SessionId,
-        path: PathBuf,
+        path: String,
         line: Option<u32>,
         limit: Option<u32>,
     ) -> Result<String, String> {
         let (tx, rx) = oneshot::channel();
         let request = acp::ReadTextFileRequest {
-            session_id,
-            path,
+            session_id: session_id.clone(),
+            path: path.into(),
             line,
             limit,
             meta: None,
         };
         self.client_tx
-            .send(ClientOp::ReadTextFile(request, tx))
+            .send(ClientOp::ReadTextFile {
+                session_id,
+                request,
+                response_tx: tx,
+            })
             .map_err(|_| "client read_text_file channel closed".to_string())?;
 
         match rx.await {
@@ -305,7 +309,11 @@ impl FsBridgeInner {
         content: String,
     ) -> Result<(), String> {
         match self
-            .write_via_client(session_id.clone(), path.to_path_buf(), content.clone())
+            .write_via_client(
+                session_id.clone(),
+                path.display().to_string(),
+                content.clone(),
+            )
             .await
         {
             Ok(()) => Ok(()),
@@ -319,18 +327,22 @@ impl FsBridgeInner {
     async fn write_via_client(
         &self,
         session_id: acp::SessionId,
-        path: PathBuf,
+        path: String,
         content: String,
     ) -> Result<(), String> {
         let (tx, rx) = oneshot::channel();
         let request = acp::WriteTextFileRequest {
-            session_id,
-            path,
+            session_id: session_id.clone(),
+            path: path.into(),
             content,
             meta: None,
         };
         self.client_tx
-            .send(ClientOp::WriteTextFile(request, tx))
+            .send(ClientOp::WriteTextFile {
+                session_id,
+                request,
+                response_tx: tx,
+            })
             .map_err(|_| "client write_text_file channel closed".to_string())?;
 
         match rx.await {

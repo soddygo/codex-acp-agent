@@ -4,31 +4,31 @@ use codex_core::config::Config as CodexConfig;
 
 #[test]
 fn is_read_only_mode_basic() {
-    assert!(crate::agent::modes::is_read_only_mode(
+    assert!(crate::agent::session::is_read_only_mode(
         &agent_client_protocol::SessionModeId("read-only".into())
     ));
-    assert!(!crate::agent::modes::is_read_only_mode(
+    assert!(!crate::agent::session::is_read_only_mode(
         &agent_client_protocol::SessionModeId("not-read-only".into())
     ));
 }
 
 #[test]
 fn current_mode_id_for_config_matches_read_only_if_available() {
-    if let Some(ro) = crate::agent::modes::APPROVAL_PRESETS
+    if let Some(ro) = crate::agent::session::APPROVAL_PRESETS
         .iter()
         .find(|p| p.id == "read-only")
     {
         let mut cfg = CodexConfig::default();
         cfg.approval_policy = ro.approval;
         cfg.sandbox_policy = ro.sandbox.clone();
-        let mid = crate::agent::modes::current_mode_id_for_config(&cfg);
+        let mid = crate::agent::session::current_mode_id_for_config(&cfg);
         assert_eq!(mid.as_ref().map(|m| m.0.as_ref()), Some("read-only"));
     }
 }
 
 #[test]
 fn current_mode_id_for_config_none_on_mismatch() {
-    let presets = &*crate::agent::modes::APPROVAL_PRESETS;
+    let presets = &*crate::agent::session::APPROVAL_PRESETS;
     if presets.len() >= 2 {
         let a = &presets[0];
         let mut b = &presets[1];
@@ -40,7 +40,7 @@ fn current_mode_id_for_config_none_on_mismatch() {
         let mut cfg = CodexConfig::default();
         cfg.approval_policy = a.approval;
         cfg.sandbox_policy = b.sandbox.clone();
-        let mid = crate::agent::modes::current_mode_id_for_config(&cfg);
+        let mid = crate::agent::session::current_mode_id_for_config(&cfg);
         assert!(
             mid.is_none(),
             "expected None for mismatched approval/sandbox"
@@ -52,15 +52,15 @@ use std::collections::HashSet;
 
 use agent_client_protocol as acp;
 
-use crate::agent::modes;
+use crate::agent::session;
 
 /// Ensure available_modes aligns with APPROVAL_PRESETS (1:1 by id)
 #[test]
 fn available_modes_match_presets() {
-    let presets_len = modes::APPROVAL_PRESETS.len();
+    let presets_len = session::APPROVAL_PRESETS.len();
     assert!(presets_len > 0, "approval presets must not be empty");
 
-    let available = modes::available_modes();
+    let available = session::available_modes();
     assert_eq!(
         available.len(),
         presets_len,
@@ -68,7 +68,7 @@ fn available_modes_match_presets() {
     );
 
     // Compare IDs as sets for equality
-    let preset_ids: HashSet<String> = modes::APPROVAL_PRESETS
+    let preset_ids: HashSet<String> = session::APPROVAL_PRESETS
         .iter()
         .map(|p| p.id.to_string())
         .collect();
@@ -104,8 +104,8 @@ fn available_modes_match_presets() {
 /// Ensure find_preset_by_mode_id returns the matching preset for each available mode.
 #[test]
 fn find_preset_roundtrip() {
-    for mode in modes::available_modes() {
-        let found = modes::find_preset_by_mode_id(&mode.id);
+    for mode in session::available_modes() {
+        let found = session::find_preset_by_mode_id(&mode.id);
         assert!(
             found.is_some(),
             "find_preset_by_mode_id should return Some for id={}",
@@ -134,7 +134,7 @@ fn find_preset_roundtrip() {
 /// Mode IDs should be unique and stable per preset set.
 #[test]
 fn mode_ids_unique() {
-    let available = modes::available_modes();
+    let available = session::available_modes();
     let mut uniq = HashSet::new();
     for mode in &available {
         let inserted = uniq.insert(mode.id.0.as_ref().to_string());
@@ -146,7 +146,7 @@ fn mode_ids_unique() {
     }
     assert_eq!(
         uniq.len(),
-        modes::APPROVAL_PRESETS.len(),
+        session::APPROVAL_PRESETS.len(),
         "unique mode id count should match presets count"
     );
 }
@@ -156,16 +156,16 @@ fn mode_ids_unique() {
 #[test]
 fn is_read_only_detection() {
     let read_only = acp::SessionModeId("read-only".into());
-    assert!(modes::is_read_only_mode(&read_only));
+    assert!(session::is_read_only_mode(&read_only));
 
-    let non_read_only_opt = modes::available_modes()
+    let non_read_only_opt = session::available_modes()
         .into_iter()
         .map(|m| m.id)
         .find(|mid| mid.0.as_ref() != "read-only");
 
     if let Some(non_ro) = non_read_only_opt {
         assert!(
-            !modes::is_read_only_mode(&non_ro),
+            !session::is_read_only_mode(&non_ro),
             "expected false for non-read-only id={}, got true",
             non_ro.0.as_ref()
         );

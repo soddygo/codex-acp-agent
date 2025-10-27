@@ -1,8 +1,8 @@
 use codex_acp::{CodexAgent, FsBridge, SessionModeLookup, agent};
 
 use agent_client_protocol::{AgentSideConnection, Client, Error};
-use anyhow::Result;
-use codex_core::config::{Config, ConfigOverrides};
+use anyhow::{Result, bail};
+use codex_core::config::{self, Config, ConfigOverrides};
 use std::env;
 use tokio::{
     io,
@@ -28,9 +28,22 @@ async fn main() -> Result<()> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (client_tx, mut client_rx) = mpsc::unbounded_channel();
 
+        // Config loading strategy:
+        // 1. Load Config first (contains resolved runtime settings)
+        // 2. Load ConfigToml to extract profiles (needed for model/mode switching)
+        //
+        // NOTE: This results in two file reads/parses. Optimizations:
+        // - We reuse config.codex_home instead of calling find_codex_home() twice
+        // - We take ownership of profiles instead of cloning
+        // - Future: codex_core could expose profiles from Config to eliminate second load
         let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default()).await?;
+        let config_toml = config::load_config_as_toml_with_cli_overrides(
+            &config.codex_home,
+            vec![],
+        ).await?;
+        let profiles = config_toml.profiles;
         let fs_bridge = FsBridge::start(client_tx.clone(), config.cwd.clone()).await?;
-        let agent = CodexAgent::with_config(tx, client_tx, config, Some(fs_bridge));
+        let agent = CodexAgent::with_config(tx, client_tx, config, profiles, Some(fs_bridge));
         let session_modes = SessionModeLookup::from(&agent);
         let (conn, handle_io) = AgentSideConnection::new(agent, outgoing, incoming, |fut| {
             task::spawn_local(fut);
@@ -51,11 +64,11 @@ async fn main() -> Result<()> {
                     }
                     op = client_rx.recv() => {
                         match op {
-                            Some(agent::ClientOp::RequestPermission(req, tx)) => {
+                            Some(agent::ClientOp::RequestPermission { session_id: _, request: req, response_tx: tx }) => {
                                 let res = conn.request_permission(req).await;
                                 let _ = tx.send(res);
                             }
-                            Some(agent::ClientOp::ReadTextFile(mut req, tx)) => {
+                            Some(agent::ClientOp::ReadTextFile { session_id: _, request: mut req, response_tx: tx }) => {
                                 match session_modes.resolve_acp_session_id(&req.session_id) {
                                     Some(resolved_id) => {
                                         req.session_id = resolved_id;
@@ -69,7 +82,7 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             }
-                            Some(agent::ClientOp::WriteTextFile(mut req, tx)) => {
+                            Some(agent::ClientOp::WriteTextFile { session_id: _, request: mut req, response_tx: tx }) => {
                                 match session_modes.resolve_acp_session_id(&req.session_id) {
                                     Some(resolved_id) => {
                                         req.session_id = resolved_id.clone();
@@ -98,7 +111,7 @@ async fn main() -> Result<()> {
 
         match handle_io.await {
             Ok(()) => Ok(()),
-            Err(e) => Err(anyhow::Error::new(e)),
+            Err(e) => bail!(e),
         }
     }).await
 }
