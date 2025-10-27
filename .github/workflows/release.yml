@@ -85,6 +85,34 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate Release Notes
+        id: release_notes
+        run: |
+          # Get the previous tag
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+
+          # Generate release notes
+          if [ -z "$PREV_TAG" ]; then
+            # First release, get all commits
+            NOTES=$(git log --pretty=format:"- %s (%h)" --no-merges)
+          else
+            # Get commits since previous tag
+            NOTES=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges)
+          fi
+
+          # Create release notes file
+          echo "## Changes" > release_notes.md
+          echo "" >> release_notes.md
+          echo "$NOTES" >> release_notes.md
+
+          # Set output for use in next step
+          echo "notes_file=release_notes.md" >> $GITHUB_OUTPUT
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -95,5 +123,7 @@ jobs:
         with:
           files: |
             dist/**/**
+          body_path: ${{ steps.release_notes.outputs.notes_file }}
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
