@@ -4,7 +4,11 @@ use tokio::{sync::oneshot, task};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::{commands, core::CodexAgent, session};
+use super::{
+    commands,
+    core::CodexAgent,
+    session::{self, is_custom_provider},
+};
 
 impl CodexAgent {
     /// Create a new session with the given configuration.
@@ -82,12 +86,19 @@ impl CodexAgent {
             });
         }
 
-        // Build models response with current model and available models from profiles
-        let models = Some(acp::SessionModelState {
-            current_model_id: session::current_model_id_from_config(&self.config),
-            available_models: session::available_models_from_profiles(&self.config, &self.profiles),
-            meta: None,
-        });
+        // Build models response only for custom providers
+        let models = if is_custom_provider(&self.config.model_provider_id) {
+            Some(acp::SessionModelState {
+                current_model_id: session::current_model_id_from_config(&self.config),
+                available_models: session::available_models_from_profiles(
+                    &self.config,
+                    &self.profiles,
+                ),
+                meta: None,
+            })
+        } else {
+            None
+        };
 
         Ok(acp::NewSessionResponse {
             session_id: acp::SessionId(acp_session_id.clone().into()),
@@ -120,11 +131,19 @@ impl CodexAgent {
             session::current_model_id_from_config(&self.config)
         };
 
-        let models = Some(acp::SessionModelState {
-            current_model_id,
-            available_models: session::available_models_from_profiles(&self.config, &self.profiles),
-            meta: None,
-        });
+        // Build models response only for custom providers
+        let models = if is_custom_provider(&self.config.model_provider_id) {
+            Some(acp::SessionModelState {
+                current_model_id,
+                available_models: session::available_models_from_profiles(
+                    &self.config,
+                    &self.profiles,
+                ),
+                meta: None,
+            })
+        } else {
+            None
+        };
 
         Ok(acp::LoadSessionResponse {
             modes: Some(acp::SessionModeState {
@@ -174,11 +193,20 @@ impl CodexAgent {
     ///
     /// This preserves the current approval and sandbox settings while updating
     /// the model and its associated reasoning effort level.
+    ///
+    /// This method is only available when using a custom (non-builtin) provider.
     pub(super) async fn set_session_model(
         &self,
         args: acp::SetSessionModelRequest,
     ) -> Result<acp::SetSessionModelResponse, acp::Error> {
         info!(?args, "Received set session model request");
+
+        // Check if current provider is custom
+        if !is_custom_provider(&self.config.model_provider_id) {
+            return Err(acp::Error::invalid_params().with_data(
+                "set_session_model is only available when using a custom provider. Current provider is a builtin provider.",
+            ));
+        }
 
         // Parse and validate the model_id, extracting provider, model name, and effort
         let model_ctx =
@@ -187,6 +215,13 @@ impl CodexAgent {
                     acp::Error::invalid_params()
                         .with_data("invalid model id format or provider/model not found")
                 })?;
+
+        // Ensure the requested model is also from a custom provider
+        if !is_custom_provider(&model_ctx.provider_id) {
+            return Err(acp::Error::invalid_params().with_data(
+                "Cannot switch to a builtin provider model. Only custom provider models are allowed.",
+            ));
+        }
 
         self.apply_context_override(
             &args.session_id,

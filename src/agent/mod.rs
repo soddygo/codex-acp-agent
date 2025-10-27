@@ -12,6 +12,9 @@ mod session;
 mod sessions;
 mod utils;
 
+#[cfg(test)]
+mod tests;
+
 // Public exports
 pub use context::ClientOp;
 pub use core::CodexAgent;

@@ -66,6 +66,14 @@ pub fn is_read_only_mode(mode_id: &acp::SessionModeId) -> bool {
     mode_id.0.as_ref() == "read-only"
 }
 
+/// Check if a provider is a custom (non-builtin) provider.
+///
+/// Builtin providers are: "openai"
+/// All other providers are considered custom and may require additional authentication.
+pub fn is_custom_provider(provider_id: &str) -> bool {
+    !matches!(provider_id, "openai")
+}
+
 /// Model context containing provider, model name, and associated reasoning effort.
 #[derive(Debug, Clone)]
 pub struct ModelContext {
@@ -114,6 +122,7 @@ fn build_model_info(config: &CodexConfig, model_ctx: &ModelContext) -> Option<ac
 /// Return the list of ACP `ModelInfo` entries derived from profiles.
 ///
 /// Each ModelInfo represents a {provider}@{model} combination from the profiles configuration.
+/// Only includes custom (non-builtin) providers.
 pub fn available_models_from_profiles(
     config: &CodexConfig,
     profiles: &HashMap<String, ConfigProfile>,
@@ -121,16 +130,23 @@ pub fn available_models_from_profiles(
     let mut models = Vec::new();
     let mut seen = HashSet::new();
 
-    // Add the current model from config first
+    // Add the current model from config first (only if it's a custom provider)
     let current_ctx = ModelContext::from_config(config);
-    if let Some(model_info) = build_model_info(config, &current_ctx) {
+    if is_custom_provider(&current_ctx.provider_id)
+        && let Some(model_info) = build_model_info(config, &current_ctx)
+    {
         seen.insert(current_ctx.to_model_id());
         models.push(model_info);
     }
 
-    // Extract unique model combinations from profiles
+    // Extract unique model combinations from profiles (only custom providers)
     for profile in profiles.values() {
         if let (Some(model_name), Some(provider_id)) = (&profile.model, &profile.model_provider) {
+            // Skip builtin providers
+            if !is_custom_provider(provider_id) {
+                continue;
+            }
+
             let model_ctx = ModelContext {
                 provider_id: provider_id.clone(),
                 model_name: model_name.clone(),
