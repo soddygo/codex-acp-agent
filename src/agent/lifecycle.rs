@@ -33,8 +33,8 @@ impl CodexAgent {
         // Add custom provider auth method if using a custom provider
         if session::is_custom_provider(&self.config.model_provider_id) {
             auth_methods.push(acp::AuthMethod {
-                id: acp::AuthMethodId("custom_provider".into()),
-                name: "Custom Provider".into(),
+                id: acp::AuthMethodId(self.config.model_provider_id.clone().into()),
+                name: self.config.model_provider.name.clone(),
                 description: Some(format!(
                     "Authenticate with custom provider: {}",
                     self.config.model_provider_id
