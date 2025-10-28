@@ -3,7 +3,6 @@ use agent_client_protocol::{self as acp, Agent};
 // Submodules
 mod commands;
 mod config_builder;
-mod context;
 mod core;
 mod events;
 mod lifecycle;
@@ -13,9 +12,8 @@ mod sessions;
 mod utils;
 
 // Public exports
-pub use context::ClientOp;
 pub use core::CodexAgent;
-pub use session::SessionModeLookup;
+pub use session::{ClientOp, SessionModeLookup};
 
 impl From<&CodexAgent> for SessionModeLookup {
     fn from(agent: &CodexAgent) -> Self {

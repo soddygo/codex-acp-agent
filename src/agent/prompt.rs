@@ -8,7 +8,7 @@ use serde_json::json;
 use tokio::sync::oneshot;
 use tracing::info;
 
-use super::{context::ClientOp, core::CodexAgent, events};
+use super::{core::CodexAgent, events, session::ClientOp};
 
 impl CodexAgent {
     /// Process a user prompt and stream responses back to the client.

@@ -1,6 +1,6 @@
 use std::{collections::HashMap, env, time::Duration};
 
-use agent_client_protocol as acp;
+use agent_client_protocol::{Error, HttpHeader, McpServer};
 use codex_core::{
     config::Config as CodexConfig,
     config_types::{McpServerConfig, McpServerTransportConfig},
@@ -19,9 +19,9 @@ impl CodexAgent {
         &self,
         session_id: &str,
         bridge: &FsBridge,
-    ) -> Result<McpServerConfig, acp::Error> {
+    ) -> Result<McpServerConfig, Error> {
         let exe_path = env::current_exe().map_err(|err| {
-            acp::Error::internal_error().with_data(format!("failed to locate agent binary: {err}"))
+            Error::internal_error().with_data(format!("failed to locate agent binary: {err}"))
         })?;
 
         let mut env = HashMap::new();
@@ -63,7 +63,7 @@ impl CodexAgent {
     fn build_streamable_http_server(
         name: String,
         url: String,
-        headers: Vec<acp::HttpHeader>,
+        headers: Vec<HttpHeader>,
         startup_timeout: Option<Duration>,
         tool_timeout: Option<Duration>,
     ) -> (String, McpServerConfig) {
@@ -92,13 +92,12 @@ impl CodexAgent {
     /// Build an MCP server configuration from an ACP McpServer specification.
     pub(super) fn build_mcp_server(
         &self,
-        server: acp::McpServer,
+        server: McpServer,
         startup_timeout: Option<Duration>,
         tool_timeout: Option<Duration>,
     ) -> Option<(String, McpServerConfig)> {
         match server {
-            acp::McpServer::Http { name, url, headers }
-            | acp::McpServer::Sse { name, url, headers } => {
+            McpServer::Http { name, url, headers } | McpServer::Sse { name, url, headers } => {
                 Some(Self::build_streamable_http_server(
                     name,
                     url.to_string(),
@@ -107,7 +106,7 @@ impl CodexAgent {
                     tool_timeout,
                 ))
             }
-            acp::McpServer::Stdio {
+            McpServer::Stdio {
                 name,
                 command,
                 args,
@@ -152,8 +151,8 @@ impl CodexAgent {
     pub(super) fn build_session_config(
         &self,
         session_id: &str,
-        mcp_servers: Vec<acp::McpServer>,
-    ) -> Result<CodexConfig, acp::Error> {
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<CodexConfig, Error> {
         let mut session_config = self.config.clone();
         let fs_guidance = include_str!("prompt_fs_guidance.md");
 

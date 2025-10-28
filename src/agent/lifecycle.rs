@@ -1,6 +1,9 @@
 use std::env;
 
-use agent_client_protocol as acp;
+use agent_client_protocol::{
+    AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse, Error,
+    Implementation, InitializeRequest, InitializeResponse, McpCapabilities, PromptCapabilities, V1,
+};
 use codex_app_server_protocol::AuthMode;
 use tracing::info;
 
@@ -10,20 +13,20 @@ impl CodexAgent {
     /// Initialize the agent and return supported capabilities and authentication methods.
     pub(super) async fn initialize(
         &self,
-        args: acp::InitializeRequest,
-    ) -> Result<acp::InitializeResponse, acp::Error> {
+        args: InitializeRequest,
+    ) -> Result<InitializeResponse, Error> {
         info!(?args, "Received initialize request");
 
         // Advertise supported auth methods based on the configured provider
         let mut auth_methods = vec![
-            acp::AuthMethod {
-                id: acp::AuthMethodId("chatgpt".into()),
+            AuthMethod {
+                id: AuthMethodId("chatgpt".into()),
                 name: "ChatGPT".into(),
                 description: Some("Sign in with ChatGPT to use your plan".into()),
                 meta: None,
             },
-            acp::AuthMethod {
-                id: acp::AuthMethodId("apikey".into()),
+            AuthMethod {
+                id: AuthMethodId("apikey".into()),
                 name: "OpenAI API Key".into(),
                 description: Some("Use OPENAI_API_KEY from environment or auth.json".into()),
                 meta: None,
@@ -32,8 +35,8 @@ impl CodexAgent {
 
         // Add custom provider auth method if using a custom provider
         if session::is_custom_provider(&self.config.model_provider_id) {
-            auth_methods.push(acp::AuthMethod {
-                id: acp::AuthMethodId(self.config.model_provider_id.clone().into()),
+            auth_methods.push(AuthMethod {
+                id: AuthMethodId(self.config.model_provider_id.clone().into()),
                 name: self.config.model_provider.name.clone(),
                 description: Some(format!(
                     "Authenticate with custom provider: {}",
@@ -45,15 +48,15 @@ impl CodexAgent {
 
         self.client_capabilities.replace(args.client_capabilities);
 
-        let agent_capabilities = acp::AgentCapabilities {
+        let agent_capabilities = AgentCapabilities {
             load_session: false,
-            prompt_capabilities: acp::PromptCapabilities {
+            prompt_capabilities: PromptCapabilities {
                 image: true,
                 audio: false,
                 embedded_context: true,
                 meta: None,
             },
-            mcp_capabilities: acp::McpCapabilities {
+            mcp_capabilities: McpCapabilities {
                 http: true,
                 sse: true,
                 meta: None,
@@ -61,11 +64,11 @@ impl CodexAgent {
             meta: None,
         };
 
-        Ok(acp::InitializeResponse {
-            protocol_version: acp::V1,
+        Ok(InitializeResponse {
+            protocol_version: V1,
             agent_capabilities,
             auth_methods,
-            agent_info: Some(acp::Implementation {
+            agent_info: Some(Implementation {
                 name: "codex-acp".into(),
                 title: Some("Codex ACP".into()),
                 version: env!("CARGO_PKG_VERSION").into(),
@@ -77,8 +80,8 @@ impl CodexAgent {
     /// Authenticate the client using the specified authentication method.
     pub(super) async fn authenticate(
         &self,
-        args: acp::AuthenticateRequest,
-    ) -> Result<acp::AuthenticateResponse, acp::Error> {
+        args: AuthenticateRequest,
+    ) -> Result<AuthenticateResponse, Error> {
         info!(?args, "Received authenticate request");
 
         let method = args.method_id.0.as_ref();
@@ -92,7 +95,7 @@ impl CodexAgent {
                         return Ok(Default::default());
                     }
                 }
-                Err(acp::Error::auth_required().with_data("Failed to load API key auth"))
+                Err(Error::auth_required().with_data("Failed to load API key auth"))
             }
             "chatgpt" => {
                 if let Ok(am) = self.auth_manager.write() {
@@ -103,13 +106,13 @@ impl CodexAgent {
                         return Ok(Default::default());
                     }
                 }
-                Err(acp::Error::auth_required()
+                Err(Error::auth_required()
                     .with_data("ChatGPT login not found. Run `codex login` to connect your plan."))
             }
             "custom_provider" => {
                 // For custom providers, check if the provider is configured
                 if !session::is_custom_provider(&self.config.model_provider_id) {
-                    return Err(acp::Error::invalid_params().with_data(
+                    return Err(Error::invalid_params().with_data(
                         "Custom provider auth method is only available for custom providers",
                     ));
                 }
@@ -120,7 +123,7 @@ impl CodexAgent {
                     .model_providers
                     .contains_key(&self.config.model_provider_id)
                 {
-                    return Err(acp::Error::auth_required().with_data(format!(
+                    return Err(Error::auth_required().with_data(format!(
                         "Custom provider '{}' is not configured in model_providers",
                         self.config.model_provider_id
                     )));
@@ -136,14 +139,13 @@ impl CodexAgent {
                     }
                 }
 
-                Err(acp::Error::auth_required().with_data(format!(
+                Err(Error::auth_required().with_data(format!(
                     "Custom provider '{}' requires authentication. Please configure API credentials in your Codex config.",
                     self.config.model_provider_id
                 )))
             }
             other => {
-                Err(acp::Error::invalid_params()
-                    .with_data(format!("unknown auth method: {}", other)))
+                Err(Error::invalid_params().with_data(format!("unknown auth method: {}", other)))
             }
         }
     }

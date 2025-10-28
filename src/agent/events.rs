@@ -3,7 +3,12 @@ use std::{
     sync::Arc,
 };
 
-use agent_client_protocol as acp;
+use agent_client_protocol::{
+    Diff, PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SessionId, SessionUpdate, TerminalId,
+    ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind,
+};
 use codex_core::protocol::{FileChange, McpInvocation, ReviewDecision};
 use codex_protocol::parse_command::ParsedCommand;
 use serde_json::json;
@@ -30,7 +35,7 @@ pub struct ExecEndArgs {
 pub struct EventHandler {
     cwd: PathBuf,
     support_terminal: bool,
-    permission_options: Arc<Vec<acp::PermissionOption>>,
+    permission_options: Arc<Vec<PermissionOption>>,
 }
 
 impl EventHandler {
@@ -49,20 +54,20 @@ impl EventHandler {
         &self,
         call_id: &str,
         invocation: &McpInvocation,
-    ) -> acp::SessionUpdate {
+    ) -> SessionUpdate {
         let (title, locations) = utils::describe_mcp_tool(invocation, &self.cwd);
-        let tool = acp::ToolCall {
-            id: acp::ToolCallId(call_id.into()),
+        let tool = ToolCall {
+            id: ToolCallId(call_id.into()),
             title,
-            kind: acp::ToolKind::Fetch,
-            status: acp::ToolCallStatus::InProgress,
+            kind: ToolKind::Fetch,
+            status: ToolCallStatus::InProgress,
             content: Vec::new(),
             locations,
             raw_input: invocation.arguments.clone(),
             raw_output: None,
             meta: None,
         };
-        acp::SessionUpdate::ToolCall(tool)
+        SessionUpdate::ToolCall(tool)
     }
 
     /// Build a ToolCallUpdate for "MCP Tool Call End".
@@ -72,17 +77,17 @@ impl EventHandler {
         invocation: &McpInvocation,
         result: &serde_json::Value,
         success: bool,
-    ) -> acp::SessionUpdate {
+    ) -> SessionUpdate {
         let status = if success {
-            acp::ToolCallStatus::Completed
+            ToolCallStatus::Completed
         } else {
-            acp::ToolCallStatus::Failed
+            ToolCallStatus::Failed
         };
         let raw_output = Some(result.clone());
         let (title, locations) = utils::describe_mcp_tool(invocation, &self.cwd);
-        let update = acp::ToolCallUpdate {
-            id: acp::ToolCallId(call_id.into()),
-            fields: acp::ToolCallUpdateFields {
+        let update = ToolCallUpdate {
+            id: ToolCallId(call_id.into()),
+            fields: ToolCallUpdateFields {
                 status: Some(status),
                 title: Some(title),
                 locations: if locations.is_empty() {
@@ -95,7 +100,7 @@ impl EventHandler {
             },
             meta: None,
         };
-        acp::SessionUpdate::ToolCallUpdate(update)
+        SessionUpdate::ToolCallUpdate(update)
     }
 
     // ---- Exec command calls ----
@@ -107,7 +112,7 @@ impl EventHandler {
         cwd: &Path,
         command: &[String],
         parsed_cmd: &[ParsedCommand],
-    ) -> acp::SessionUpdate {
+    ) -> SessionUpdate {
         let utils::FormatCommandCall {
             title,
             locations,
@@ -116,8 +121,8 @@ impl EventHandler {
         } = utils::format_command_call(cwd, parsed_cmd);
 
         let (content, meta) = if self.support_terminal && terminal_output {
-            let content = vec![acp::ToolCallContent::Terminal {
-                terminal_id: acp::TerminalId(call_id.into()),
+            let content = vec![ToolCallContent::Terminal {
+                terminal_id: TerminalId(call_id.into()),
             }];
             let meta = Some(json!({
                 "terminal_info": {
@@ -130,11 +135,11 @@ impl EventHandler {
             (vec![], None)
         };
 
-        let tool = acp::ToolCall {
-            id: acp::ToolCallId(call_id.into()),
+        let tool = ToolCall {
+            id: ToolCallId(call_id.into()),
             title,
             kind,
-            status: acp::ToolCallStatus::InProgress,
+            status: ToolCallStatus::InProgress,
             content,
             locations,
             raw_input: Some(json!({
@@ -145,21 +150,21 @@ impl EventHandler {
             raw_output: None,
             meta,
         };
-        acp::SessionUpdate::ToolCall(tool)
+        SessionUpdate::ToolCall(tool)
     }
 
     /// Arguments for "Exec Command End" update generation.
     /// Build a ToolCallUpdate for "Exec Command End".
-    pub fn on_exec_command_end(&self, end: ExecEndArgs) -> acp::SessionUpdate {
+    pub fn on_exec_command_end(&self, end: ExecEndArgs) -> SessionUpdate {
         let status = if end.exit_code == 0 {
-            acp::ToolCallStatus::Completed
+            ToolCallStatus::Completed
         } else {
-            acp::ToolCallStatus::Failed
+            ToolCallStatus::Failed
         };
 
-        let mut content: Vec<acp::ToolCallContent> = Vec::new();
+        let mut content: Vec<ToolCallContent> = Vec::new();
         if !end.aggregated_output.is_empty() {
-            content.push(acp::ToolCallContent::from(end.aggregated_output.clone()));
+            content.push(ToolCallContent::from(end.aggregated_output.clone()));
         } else if !end.stdout.is_empty() || !end.stderr.is_empty() {
             let merged = if !end.stderr.is_empty() {
                 format!("{}\n{}", end.stdout, end.stderr)
@@ -167,13 +172,13 @@ impl EventHandler {
                 end.stdout.clone()
             };
             if !merged.is_empty() {
-                content.push(acp::ToolCallContent::from(merged));
+                content.push(ToolCallContent::from(merged));
             }
         }
 
-        let update = acp::ToolCallUpdate {
-            id: acp::ToolCallId(end.call_id.into()),
-            fields: acp::ToolCallUpdateFields {
+        let update = ToolCallUpdate {
+            id: ToolCallId(end.call_id.into()),
+            fields: ToolCallUpdateFields {
                 status: Some(status),
                 content: if content.is_empty() {
                     None
@@ -190,17 +195,17 @@ impl EventHandler {
             meta: None,
         };
 
-        acp::SessionUpdate::ToolCallUpdate(update)
+        SessionUpdate::ToolCallUpdate(update)
     }
 
     /// Build a permission request for an exec approval.
     pub fn on_exec_approval_request(
         &self,
-        session_id: &acp::SessionId,
+        session_id: &SessionId,
         call_id: &str,
         cwd: &Path,
         parsed_cmd: &[ParsedCommand],
-    ) -> acp::RequestPermissionRequest {
+    ) -> RequestPermissionRequest {
         let utils::FormatCommandCall {
             title,
             locations,
@@ -208,11 +213,11 @@ impl EventHandler {
             kind,
         } = utils::format_command_call(cwd, parsed_cmd);
 
-        let update = acp::ToolCallUpdate {
-            id: acp::ToolCallId(call_id.into()),
-            fields: acp::ToolCallUpdateFields {
+        let update = ToolCallUpdate {
+            id: ToolCallId(call_id.into()),
+            fields: ToolCallUpdateFields {
                 kind: Some(kind),
-                status: Some(acp::ToolCallStatus::Pending),
+                status: Some(ToolCallStatus::Pending),
                 title: Some(title),
                 locations: if locations.is_empty() {
                     None
@@ -224,7 +229,7 @@ impl EventHandler {
             meta: None,
         };
 
-        acp::RequestPermissionRequest {
+        RequestPermissionRequest {
             session_id: session_id.clone(),
             tool_call: update,
             options: self.permission_options.as_ref().clone(),
@@ -237,15 +242,15 @@ impl EventHandler {
     /// Build a permission request for "Apply Patch Approval Request".
     pub fn on_apply_patch_approval_request(
         &self,
-        session_id: &acp::SessionId,
+        session_id: &SessionId,
         call_id: &str,
         changes: &[(String, FileChange)],
-    ) -> acp::RequestPermissionRequest {
-        let mut contents: Vec<acp::ToolCallContent> = Vec::new();
+    ) -> RequestPermissionRequest {
+        let mut contents: Vec<ToolCallContent> = Vec::new();
         for (path, change) in changes.iter() {
             match change {
                 FileChange::Add { content } => {
-                    contents.push(acp::ToolCallContent::from(acp::Diff {
+                    contents.push(ToolCallContent::from(Diff {
                         path: PathBuf::from(path),
                         old_text: None,
                         new_text: content.clone(),
@@ -253,7 +258,7 @@ impl EventHandler {
                     }));
                 }
                 FileChange::Delete { content } => {
-                    contents.push(acp::ToolCallContent::from(acp::Diff {
+                    contents.push(ToolCallContent::from(Diff {
                         path: PathBuf::from(path),
                         old_text: Some(content.clone()),
                         new_text: "".into(),
@@ -261,7 +266,7 @@ impl EventHandler {
                     }));
                 }
                 FileChange::Update { unified_diff, .. } => {
-                    contents.push(acp::ToolCallContent::from(acp::Diff {
+                    contents.push(ToolCallContent::from(Diff {
                         path: PathBuf::from(path),
                         old_text: Some(unified_diff.into()),
                         new_text: unified_diff.clone(),
@@ -277,11 +282,11 @@ impl EventHandler {
             format!("Edit {} files", changes.len())
         };
 
-        let update = acp::ToolCallUpdate {
-            id: acp::ToolCallId(call_id.into()),
-            fields: acp::ToolCallUpdateFields {
-                kind: Some(acp::ToolKind::Edit),
-                status: Some(acp::ToolCallStatus::Pending),
+        let update = ToolCallUpdate {
+            id: ToolCallId(call_id.into()),
+            fields: ToolCallUpdateFields {
+                kind: Some(ToolKind::Edit),
+                status: Some(ToolCallStatus::Pending),
                 title: Some(title),
                 content: if contents.is_empty() {
                     None
@@ -293,7 +298,7 @@ impl EventHandler {
             meta: None,
         };
 
-        acp::RequestPermissionRequest {
+        RequestPermissionRequest {
             session_id: session_id.clone(),
             tool_call: update,
             options: self.permission_options.as_ref().clone(),
@@ -307,14 +312,14 @@ impl EventHandler {
         call_id: &str,
         success: bool,
         raw_event_json: serde_json::Value,
-    ) -> acp::SessionUpdate {
-        let update = acp::ToolCallUpdate {
-            id: acp::ToolCallId(call_id.into()),
-            fields: acp::ToolCallUpdateFields {
+    ) -> SessionUpdate {
+        let update = ToolCallUpdate {
+            id: ToolCallId(call_id.into()),
+            fields: ToolCallUpdateFields {
                 status: Some(if success {
-                    acp::ToolCallStatus::Completed
+                    ToolCallStatus::Completed
                 } else {
-                    acp::ToolCallStatus::Failed
+                    ToolCallStatus::Failed
                 }),
                 raw_output: Some(raw_event_json),
                 ..Default::default()
@@ -322,41 +327,41 @@ impl EventHandler {
             meta: None,
         };
 
-        acp::SessionUpdate::ToolCallUpdate(update)
+        SessionUpdate::ToolCallUpdate(update)
     }
 }
 
 /// Map an approval response to the `ReviewDecision` used by Codex operations.
-pub fn handle_response_outcome(resp: acp::RequestPermissionResponse) -> ReviewDecision {
+pub fn handle_response_outcome(resp: RequestPermissionResponse) -> ReviewDecision {
     match resp.outcome {
-        acp::RequestPermissionOutcome::Selected { option_id } => match option_id.0.as_ref() {
+        RequestPermissionOutcome::Selected { option_id } => match option_id.0.as_ref() {
             "approved" => ReviewDecision::Approved,
             "approved-for-session" => ReviewDecision::ApprovedForSession,
             _ => ReviewDecision::Abort,
         },
-        acp::RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
+        RequestPermissionOutcome::Cancelled => ReviewDecision::Abort,
     }
 }
 
 /// Build the default permission options set for approval requests.
-pub fn default_permission_options() -> Arc<Vec<acp::PermissionOption>> {
+pub fn default_permission_options() -> Arc<Vec<PermissionOption>> {
     Arc::new(vec![
-        acp::PermissionOption {
-            id: acp::PermissionOptionId("approved-for-session".into()),
+        PermissionOption {
+            id: PermissionOptionId("approved-for-session".into()),
             name: "Approved Always".into(),
-            kind: acp::PermissionOptionKind::AllowAlways,
+            kind: PermissionOptionKind::AllowAlways,
             meta: None,
         },
-        acp::PermissionOption {
-            id: acp::PermissionOptionId("approved".into()),
+        PermissionOption {
+            id: PermissionOptionId("approved".into()),
             name: "Approved".into(),
-            kind: acp::PermissionOptionKind::AllowOnce,
+            kind: PermissionOptionKind::AllowOnce,
             meta: None,
         },
-        acp::PermissionOption {
-            id: acp::PermissionOptionId("abort".into()),
+        PermissionOption {
+            id: PermissionOptionId("abort".into()),
             name: "Reject".into(),
-            kind: acp::PermissionOptionKind::RejectOnce,
+            kind: PermissionOptionKind::RejectOnce,
             meta: None,
         },
     ])

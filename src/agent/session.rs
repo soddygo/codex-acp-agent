@@ -5,7 +5,11 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use agent_client_protocol as acp;
+use agent_client_protocol::{
+    Error, ModelId, ModelInfo, ReadTextFileRequest, ReadTextFileResponse, RequestPermissionRequest,
+    RequestPermissionResponse, SessionId, SessionMode, SessionModeId, SessionModeState,
+    WriteTextFileRequest, WriteTextFileResponse,
+};
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
     CodexConversation,
@@ -14,17 +18,51 @@ use codex_core::{
     protocol::{AskForApproval, SandboxPolicy, TokenUsage},
     protocol_config_types::ReasoningEffort,
 };
+use tokio::sync::oneshot::Sender;
 
 /// All available approval presets used to derive ACP session modes.
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 
+/// Context needed for applying turn context overrides.
+///
+/// This encapsulates the current session state that needs to be preserved
+/// or selectively overridden when changing session modes or models.
+pub(super) struct SessionContext {
+    pub approval: AskForApproval,
+    pub sandbox: SandboxPolicy,
+    pub model: Option<String>,
+    pub effort: Option<ReasoningEffort>,
+}
+
+/// Operations that require client interaction.
+///
+/// These operations are sent to the client handler to request permissions,
+/// read files, or write files based on client capabilities.
+pub enum ClientOp {
+    RequestPermission {
+        session_id: SessionId,
+        request: RequestPermissionRequest,
+        response_tx: Sender<Result<RequestPermissionResponse, Error>>,
+    },
+    ReadTextFile {
+        session_id: SessionId,
+        request: ReadTextFileRequest,
+        response_tx: Sender<Result<ReadTextFileResponse, Error>>,
+    },
+    WriteTextFile {
+        session_id: SessionId,
+        request: WriteTextFileRequest,
+        response_tx: Sender<Result<WriteTextFileResponse, Error>>,
+    },
+}
+
 /// Compute the ACP `SessionModeState` (current + available) based on the provided Codex config.
 ///
 /// Returns `None` if no matching preset exists for the config's approval and sandbox policies.
-pub fn session_modes_for_config(config: &CodexConfig) -> Option<acp::SessionModeState> {
+pub fn session_modes_for_config(config: &CodexConfig) -> Option<SessionModeState> {
     let current_mode_id = current_mode_id_for_config(config)?;
 
-    Some(acp::SessionModeState {
+    Some(SessionModeState {
         current_mode_id,
         available_modes: available_modes(),
         meta: None,
@@ -34,21 +72,21 @@ pub fn session_modes_for_config(config: &CodexConfig) -> Option<acp::SessionMode
 /// Return the current ACP session mode id by matching the preset for the provided config.
 ///
 /// Returns `None` when no preset matches the (approval_policy, sandbox_policy) pair.
-pub fn current_mode_id_for_config(config: &CodexConfig) -> Option<acp::SessionModeId> {
+pub fn current_mode_id_for_config(config: &CodexConfig) -> Option<SessionModeId> {
     APPROVAL_PRESETS
         .iter()
         .find(|preset| {
             preset.approval == config.approval_policy && preset.sandbox == config.sandbox_policy
         })
-        .map(|preset| acp::SessionModeId(preset.id.into()))
+        .map(|preset| SessionModeId(preset.id.into()))
 }
 
 /// Return the list of ACP `SessionMode` entries derived from the approval presets.
-pub fn available_modes() -> Vec<acp::SessionMode> {
+pub fn available_modes() -> Vec<SessionMode> {
     APPROVAL_PRESETS
         .iter()
-        .map(|preset| acp::SessionMode {
-            id: acp::SessionModeId(preset.id.into()),
+        .map(|preset| SessionMode {
+            id: SessionModeId(preset.id.into()),
             name: preset.label.to_owned(),
             description: Some(preset.description.to_owned()),
             meta: None,
@@ -57,12 +95,12 @@ pub fn available_modes() -> Vec<acp::SessionMode> {
 }
 
 /// Find an approval preset by ACP session mode id.
-pub fn find_preset_by_mode_id(mode_id: &acp::SessionModeId) -> Option<&'static ApprovalPreset> {
+pub fn find_preset_by_mode_id(mode_id: &SessionModeId) -> Option<&'static ApprovalPreset> {
     let target = mode_id.0.as_ref();
     APPROVAL_PRESETS.iter().find(|preset| preset.id == target)
 }
 
-pub fn is_read_only_mode(mode_id: &acp::SessionModeId) -> bool {
+pub fn is_read_only_mode(mode_id: &SessionModeId) -> bool {
     mode_id.0.as_ref() == "read-only"
 }
 
@@ -99,17 +137,17 @@ impl ModelContext {
 }
 
 /// Return the current model ID in the format "provider@model".
-pub fn current_model_id_from_config(config: &CodexConfig) -> acp::ModelId {
-    acp::ModelId(ModelContext::from_config(config).to_model_id().into())
+pub fn current_model_id_from_config(config: &CodexConfig) -> ModelId {
+    ModelId(ModelContext::from_config(config).to_model_id().into())
 }
 
 /// Build a `ModelInfo` for display to the client.
-fn build_model_info(config: &CodexConfig, model_ctx: &ModelContext) -> Option<acp::ModelInfo> {
+fn build_model_info(config: &CodexConfig, model_ctx: &ModelContext) -> Option<ModelInfo> {
     let provider_info = config.model_providers.get(&model_ctx.provider_id)?;
     let model_id = model_ctx.to_model_id();
 
-    Some(acp::ModelInfo {
-        model_id: acp::ModelId(model_id.into()),
+    Some(ModelInfo {
+        model_id: ModelId(model_id.into()),
         name: format!("{}@{}", provider_info.name, model_ctx.model_name),
         description: Some(format!(
             "Provider: {}, Model: {}",
@@ -126,7 +164,7 @@ fn build_model_info(config: &CodexConfig, model_ctx: &ModelContext) -> Option<ac
 pub fn available_models_from_profiles(
     config: &CodexConfig,
     profiles: &HashMap<String, ConfigProfile>,
-) -> Vec<acp::ModelInfo> {
+) -> Vec<ModelInfo> {
     let mut models = Vec::new();
     let mut seen = HashSet::new();
 
@@ -179,7 +217,7 @@ pub fn available_models_from_profiles(
 pub fn parse_and_validate_model(
     config: &CodexConfig,
     profiles: &HashMap<String, ConfigProfile>,
-    model_id: &acp::ModelId,
+    model_id: &ModelId,
 ) -> Option<ModelContext> {
     let id_str = model_id.0.as_ref();
     let parts: Vec<&str> = id_str.split('@').collect();
@@ -234,7 +272,7 @@ pub struct SessionState {
     pub conversation: Option<Arc<CodexConversation>>,
     pub current_approval: AskForApproval,
     pub current_sandbox: SandboxPolicy,
-    pub current_mode: acp::SessionModeId,
+    pub current_mode: SessionModeId,
     pub current_model: Option<String>,
     pub current_effort: Option<ReasoningEffort>,
     pub token_usage: Option<TokenUsage>,
@@ -246,7 +284,7 @@ impl SessionState {
         fs_session_id: String,
         conversation: Option<Arc<CodexConversation>>,
         config: &CodexConfig,
-        current_mode: acp::SessionModeId,
+        current_mode: SessionModeId,
     ) -> Self {
         let model_ctx = ModelContext::from_config(config);
         Self {
@@ -285,7 +323,7 @@ impl SessionModeLookup {
     ///
     /// This will also resolve when the provided id matches an FS session id
     /// held inside a `SessionState`.
-    pub fn current_mode(&self, session_id: &acp::SessionId) -> Option<acp::SessionModeId> {
+    pub fn current_mode(&self, session_id: &SessionId) -> Option<SessionModeId> {
         let sessions = self.inner.borrow();
         if let Some(state) = sessions.get(session_id.0.as_ref()) {
             return Some(state.current_mode.clone());
@@ -298,7 +336,7 @@ impl SessionModeLookup {
     }
 
     /// Whether the resolved session is currently read-only.
-    pub fn is_read_only(&self, session_id: &acp::SessionId) -> bool {
+    pub fn is_read_only(&self, session_id: &SessionId) -> bool {
         self.current_mode(session_id)
             .map(|mode| is_read_only_mode(&mode))
             .unwrap_or(false)
@@ -306,7 +344,7 @@ impl SessionModeLookup {
 
     /// If the provided `session_id` refers to an FS session id, return the
     /// corresponding ACP session id. Otherwise, return the original ACP id.
-    pub fn resolve_acp_session_id(&self, session_id: &acp::SessionId) -> Option<acp::SessionId> {
+    pub fn resolve_acp_session_id(&self, session_id: &SessionId) -> Option<SessionId> {
         let sessions = self.inner.borrow();
         if sessions.contains_key(session_id.0.as_ref()) {
             return Some(session_id.clone());
@@ -314,7 +352,7 @@ impl SessionModeLookup {
 
         sessions.iter().find_map(|(key, state)| {
             if state.fs_session_id == session_id.0.as_ref() {
-                Some(acp::SessionId(key.clone().into()))
+                Some(SessionId(key.clone().into()))
             } else {
                 None
             }
